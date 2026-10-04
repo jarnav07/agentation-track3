@@ -245,3 +245,42 @@ different bottleneck.
 the cost is bookkeeping nobody reads (string formatting, deep copies, book snapshots, end-of-run
 metrics, a log-then-parse round trip through pandas) and interpreter/import overhead. Under Final's
 container-window timing, start-up and output writing count, so they are first-class targets.
+
+---
+
+## Phase 4 — Optimisation log
+
+Every step is checked in this order: `check_identical.py` (own seed + 2 fresh seeds per scenario,
+plus batch) → `run_regression.py` → batch units → `timer.py` on `as06`.
+
+Where the code lives: `fastsim/` (a new top-level directory — the submission image; nothing under
+`baselines/` is modified). `fastsim/fastsim/scenario.py` reproduces `abides_fork/config.py`,
+including every pre-loop NumPy draw in the baseline's order.
+
+### Step 4.1 — Tier 1: a specialised pure-Python engine (`fastsim/fastsim/pyengine.py`) — KEPT
+
+Rather than patching ABIDES piecemeal, I wrote a line-by-line re-statement of what the kernel,
+exchange, order book, `TradingAgent` and the four scheduled agents *do* for the configurations a
+scenario can express, keeping every observable and dropping every unobservable (Tier-1 items from
+the brief, all at once):
+
+* events recorded straight into columnar lists; the trace is assembled at the end with the
+  baseline's exact row-order rules (`assemble.py`), with no log → pandas → parse round trip;
+* no logging / eager f-strings / `warnings`, no deep copies of objects that are never mutated
+  afterwards, no holdings or cash bookkeeping (no agent reads it), no order history, no `book_log2`
+  snapshots, no end-of-run metrics, no summary-log pickle;
+* `heapq` on `(t, sender, recipient, message_id, …)` tuples instead of `queue.PriorityQueue`
+  (same order, no locks);
+* parquet written with pyarrow directly, with the same `pandas` schema-metadata string — byte
+  identical without importing pandas (`output.py`).
+
+RNG: unchanged — the same NumPy `RandomState` objects, the same calls, in the same order.
+
+| check | result |
+|---|---|
+| `check_identical.py --extra-seeds 2 --batch` (image `track3-fastsim:py`) | **201 / 201 byte-identical** (195 scenario×seed + 6 batch units) |
+| `run_regression.py` | **65 / 65 PASS** |
+| batch units | **6 / 6 PASS** |
+| `timer.py` as06 (median, container wall) | **53,785 ev/s** — **5.9×** baseline (9,086); ≈1.3 s per run, mostly start-up |
+| self-reported `events_per_sec`, geomean over 65 | **125,745** — **9.9×** baseline (12,661) |
+| as06 loop time (local) | 0.61 s vs 6.43 s |
