@@ -284,3 +284,37 @@ RNG: unchanged — the same NumPy `RandomState` objects, the same calls, in the 
 | `timer.py` as06 (median, container wall) | **53,785 ev/s** — **5.9×** baseline (9,086); ≈1.3 s per run, mostly start-up |
 | self-reported `events_per_sec`, geomean over 65 | **125,745** — **9.9×** baseline (12,661) |
 | as06 loop time (local) | 0.61 s vs 6.43 s |
+
+### Step 4.2 — Tier 2: the event loop, exchange, book and agents in C++ (`fastsim/csrc/`) — KEPT
+
+A direct port of `pyengine.py` into a CPython extension (`fastsim._engine`), same algorithm,
+compiled `-O3 -ffp-contract=off -fno-fast-math` (no FMA contraction, no reassociation: every
+floating-point operation happens in the same order and precision as in NumPy / CPython).
+
+* **RNG.** `csrc/rng.h` re-implements MT19937 and the NumPy *legacy* distributions the baseline
+  calls (`normal` via the cached polar Box–Muller, `lognormal`, `uniform`, `pareto` = `exp(E/a)-1`,
+  `exponential`, `randint` with masked rejection — and `randint(0, 1)` consuming nothing). State is
+  imported verbatim from each `RandomState.get_state()` after Python has done all pre-loop seeding,
+  so seeding stays NumPy's own. `fastsim/tests/test_rng.py` checks 16 call shapes × 3 seeds ×
+  100k draws against NumPy, *including the generator state afterwards*: exact.
+* **Kernel.** Binary heap of 32-byte events ordered `(t, sender, recipient, message_id)` with a
+  payload pool; same re-queue rule for agents "in the future"; same "one more message past
+  stop_time" loop condition.
+* **Order book.** Price levels in a sorted vector with the best level at the back (insertions
+  land near the back), FIFO intrusive lists per level with a running visible total, `oid → slot`
+  index for O(1) cancel lookup (only valid when the request's side and price match, exactly like
+  ABIDES's level search).
+* **Oracle.** Timestamps are Python ints until a megashock turns them into `np.float64`; the port
+  tracks that type and uses NumPy's int→float64 comparison semantics where the baseline compares a
+  `np.float64` with an int (they differ from exact Python int/float comparison above 2**53).
+* **Trace assembly** in C++ (stable sort by `(t, oid)`, quote de-duplication, merge); Python only
+  wraps the column buffers for pyarrow.
+
+| check | result |
+|---|---|
+| `check_identical.py --extra-seeds 2 --batch` (image `track3-fastsim:c1`) | **201 / 201 byte-identical** |
+| `run_regression.py` | **65 / 65 PASS** |
+| batch units | **6 / 6 PASS** |
+| `timer.py` as06 (median, container wall) | **116,148 ev/s — 12.8×** baseline; 0.57 s per run |
+| self-reported `events_per_sec`, geomean over 65 | **2,268,476 — 179×** baseline (min 488k, max 3.94M) |
+| as06 engine time (local) | 33 ms vs 6.43 s baseline loop |
