@@ -180,3 +180,68 @@ The committed `baselines/Dockerfile` is untouched. A local run of the built stac
 
 Baseline image: `track3-abides-baseline:latest`. Scoring venv: Python 3.13 + `qfbench2-common`
 2.5.1. Profiling venv: Python 3.11 + the pinned stack + patched ABIDES.
+
+---
+
+## Phase 2 — Byte-equality oracle (`scripts/check_identical.py`)
+
+For each (scenario, seed) it runs the candidate (`--candidate-image`, `--network none`, or
+`--candidate-local "<cmd>"` on the host for fast iteration), fetches the baseline image's output for
+the same pair from a cache keyed by baseline image id (`run_outputs/baseline_cache/<id>/`, filled by
+running the baseline once), compares `trace.parquet` and `message_trace.parquet` by SHA-256 and, on
+a mismatch, reports schema / row-count differences and the first diverging row with ±2 rows of
+context from both sides. It also checks `events.json` (all 8 fields, `n_events` = row count,
+`events_per_sec` within 5% of `n_events / wall_clock_sec`, `trace_sha256` correct).
+`--extra-seeds N` adds N fresh seeds per scenario (derived like `timer.py`'s seed family), because
+organizer verification re-runs on fresh seeds and Tier-A exactness has to hold at any seed.
+`--batch` runs every batch unit through `simulate-batch` and compares each sub.
+
+Validation:
+* baseline vs. itself, 65 scenarios × (own seed + 2 fresh seeds) + 6 batch units: all identical
+  (determinism of the baseline at fresh seeds confirmed);
+* mutation test: a candidate that bumps one `ORDER_FILLED` price by one tick → `DIFF`, first
+  diverging row 27, column `price`, shown with context. The oracle fails loudly.
+
+Run order after every change: `check_identical.py` (stricter), then `run_regression.py`, then
+`timer.py`.
+
+---
+
+## Phase 3 — Profile of the baseline (Python 3.11, outside Docker)
+
+Tools: `scripts/profile_baseline.py` (cProfile, self-time attributed to components) over
+`as06_throughput_fast` + one scenario from each family (`as01`, `ca_fat_tail_jumps`,
+`fastlob_core`, `eq001_pareto_latency_tail`, `gb_base_30agent_30s`, `mp01`, `ra01`), and
+`py-spy record --native` on `as06` (sampling, no per-call overhead). Raw profiles in
+`run_outputs/profile/` (not committed).
+
+**as06, py-spy (sampling), share of the whole process:**
+
+| rank | component | share |
+|---|---|---|
+| 1 | trace & ledger extraction after the run (`parse_logs_df` + pandas in `abides_fork/trace.py`) | 17.2% |
+| 2 | start-up & imports (interpreter, pandas, numpy, ABIDES) | 15.1% |
+| 3 | agent `wakeup` / `receive_message` logic (TradingAgent/ExchangeAgent dispatch, `isinstance` chains, dataclass messages) | 13.8% |
+| 4 | debug string formatting that runs even with logging off (eager f-strings → `Order.__str__` → `fmt_ts`, plus `warnings.warn`) | 13.1% |
+| 5 | order book insert / cancel / match | 6.7% |
+| 6 | exchange end-of-run metrics (`get_time_dropout`: `DataFrame.iterrows` over every book snapshot) | 6.4% |
+| 7 | latency model (`np.clip` on a scalar dominates the draw itself) | 6.3% |
+| 8 | `deepcopy` (orders, holdings dicts in `logEvent`, spread lists) | 5.8% |
+| 9 | kernel event queue (`queue.PriorityQueue`: a lock + condition per put/get) | 5.3% |
+| 10 | kernel dispatch loop | 3.1% |
+| 11 | RNG (the NumPy draws themselves) | 2.4% |
+| 12 | parquet writing | 2.2% |
+| 13 | message passing (`Kernel.send_message` + ledger dict per message) | 2.0% |
+| 14 | in-loop event logging (`logEvent` excl. its deepcopies) | 0.3% |
+
+**All 8 scenarios, cProfile self-time (inflates small-call-heavy parts):** pandas 22.0% (mostly
+`get_time_dropout` iterrows and `parse_logs_df`), agent logic 12.5%, kernel queue/dispatch 11.0%,
+builtins misc 10.6%, debug formatting 9.8%, latency/message passing 9.1%, deepcopy 8.0%, order book
+7.8%, post-run trace extraction 3.8%, numpy misc 1.9%, RNG 1.6%, parquet 0.6%. Fresh-interpreter
+`import abides_fork.simulate`: 0.59 s. The ranking is the same in every family; no family has a
+different bottleneck.
+
+**Reading.** The simulation proper (order book + RNG + queue) is under a fifth of the time. Most of
+the cost is bookkeeping nobody reads (string formatting, deep copies, book snapshots, end-of-run
+metrics, a log-then-parse round trip through pandas) and interpreter/import overhead. Under Final's
+container-window timing, start-up and output writing count, so they are first-class targets.
