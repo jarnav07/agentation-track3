@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 
 namespace fastsim {
 
@@ -98,9 +99,13 @@ class Engine {
   int64_t now = 0;
   int64_t next_mid = 1;
   int64_t next_oid = 0;
-  std::vector<Ev> heap;
-  std::vector<Msg> pool;
+  std::vector<Ev> heap;  // 4-ary min-heap on ev_greater
+  // Message payload pool in fixed-size chunks, so references stay valid while handlers allocate.
+  static constexpr int kChunkBits = 12;
+  std::vector<std::unique_ptr<Msg[]>> chunks;
+  int32_t pool_size = 0;
   std::vector<int32_t> free_slots;
+  Msg& msg(int32_t i) { return chunks[(size_t)i >> kChunkBits][i & ((1 << kChunkBits) - 1)]; }
   std::vector<int64_t> agent_time, comp_delay;
   int64_t causal = 0;
   bool has_causal = false;
@@ -143,13 +148,44 @@ class Engine {
       free_slots.pop_back();
       return i;
     }
-    pool.emplace_back();
-    return (int32_t)pool.size() - 1;
+    if ((pool_size >> kChunkBits) == (int32_t)chunks.size())
+      chunks.emplace_back(new Msg[(size_t)1 << kChunkBits]);
+    return pool_size++;
   }
 
+  // 4-ary heap: shallower than binary for the few hundred pending events a run keeps.
   void push(const Ev& e) {
+    size_t i = heap.size();
     heap.push_back(e);
-    std::push_heap(heap.begin(), heap.end(), ev_greater);
+    while (i > 0) {
+      size_t parent = (i - 1) >> 2;
+      if (!ev_greater(heap[parent], e)) break;
+      heap[i] = heap[parent];
+      i = parent;
+    }
+    heap[i] = e;
+  }
+  Ev pop() {
+    Ev top = heap[0];
+    Ev last = heap.back();
+    heap.pop_back();
+    const size_t n = heap.size();
+    if (n) {
+      size_t i = 0;
+      while (true) {
+        size_t c = 4 * i + 1;
+        if (c >= n) break;
+        size_t best = c;
+        size_t end = c + 4 < n ? c + 4 : n;
+        for (size_t k = c + 1; k < end; k++)
+          if (ev_greater(heap[best], heap[k])) best = k;
+        if (!ev_greater(last, heap[best])) break;
+        heap[i] = heap[best];
+        i = best;
+      }
+      heap[i] = last;
+    }
+    return top;
   }
 
   int64_t get_latency(int32_t s, int32_t r) {
@@ -177,7 +213,7 @@ class Engine {
   void send(int32_t sender, int32_t recipient, int64_t mid, int32_t slot, int64_t delay) {
     int64_t sent_time = now + comp_delay[sender] + delay;
     int64_t deliver_at = sent_time + get_latency(sender, recipient);
-    Msg& m = pool[slot];
+    Msg& m = msg(slot);
     m.t_send = sent_time;
     m.t_recv = deliver_at;
     m.causal = causal;
@@ -191,7 +227,7 @@ class Engine {
       return false;
     }
     int32_t slot = alloc_msg();
-    pool[slot].kind = K_WAKEUP;
+    msg(slot).kind = K_WAKEUP;
     push(Ev{t, agent, agent, next_mid++, slot});
     return true;
   }
@@ -227,7 +263,7 @@ class Engine {
   void ex_send(int32_t recipient, int8_t kind, int32_t agent, int64_t oid, int8_t is_bid,
                int64_t price, int64_t qty, bool has_oid) {
     int32_t slot = alloc_msg();
-    Msg& m = pool[slot];
+    Msg& m = msg(slot);
     m.kind = kind;
     m.agent = agent;
     m.oid = oid;
@@ -246,7 +282,7 @@ class Engine {
       int64_t mid = next_mid++;  // one MarketClosePriceMsg delivered to every subscriber
       for (int32_t a : close_price_subs) {
         int32_t slot = alloc_msg();
-        Msg& m = pool[slot];
+        Msg& m = msg(slot);
         m.kind = K_CLOSE_PRICE;
         m.has_order_id = 0;
         send(0, a, mid, slot, 0);
@@ -412,7 +448,7 @@ class Engine {
         break;
       case K_QUERY_SPREAD: {
         int32_t slot = alloc_msg();
-        Msg& r = pool[slot];
+        Msg& r = msg(slot);
         r.kind = K_SPREAD_RESP;
         r.has_order_id = 0;
         r.bid_p = bids.empty() ? 0 : bids.back().price;
@@ -435,7 +471,7 @@ class Engine {
   // -------------------------------------------------------------- traders
   void tr_send(int32_t a, int8_t kind, int64_t oid, bool is_bid, int64_t price, int64_t qty, bool has_oid) {
     int32_t slot = alloc_msg();
-    Msg& m = pool[slot];
+    Msg& m = msg(slot);
     m.kind = kind;
     m.agent = a;
     m.oid = oid;
@@ -644,7 +680,14 @@ bool Engine::run(Output& out) {
   pv = S.r_bar;
   mst = S.first_mst;
   msv = S.first_msv;
-  heap.reserve(1024);
+  heap.reserve(4096);
+  const size_t guess = 1 << 16;
+  r_t.reserve(guess); r_price.reserve(guess); r_qty.reserve(guess); r_oid.reserve(guess);
+  r_agent.reserve(guess); r_type.reserve(guess); r_bid.reserve(guess);
+  O->l_t_recv.reserve(guess); O->l_t_send.reserve(guess); O->l_latency.reserve(guess); O->l_msg_id.reserve(guess);
+  O->l_order_id.reserve(guess); O->l_causal.reserve(guess); O->l_src.reserve(guess); O->l_dst.reserve(guess);
+  O->l_kind.reserve(guess); O->l_t_send_valid.reserve(guess); O->l_order_valid.reserve(guess);
+  O->l_causal_valid.reserve(guess);
 
   if (!set_wakeup(0, S.mkt_close)) { out.error = error; return false; }
   for (int32_t a = 0; a < n; a++)
@@ -652,9 +695,7 @@ bool Engine::run(Output& out) {
   now = S.start_time;
 
   while (!heap.empty() && now != 0 && now <= S.stop_time) {
-    std::pop_heap(heap.begin(), heap.end(), ev_greater);
-    Ev e = heap.back();
-    heap.pop_back();
+    Ev e = pop();
     now = e.t;
     const int32_t r = e.recipient;
     if (agent_time[r] > e.t) {
@@ -663,8 +704,7 @@ bool Engine::run(Output& out) {
       continue;
     }
     agent_time[r] = e.t;
-    const Msg m = pool[e.payload];
-    free_slots.push_back(e.payload);
+    const Msg& m = msg(e.payload);
     bool ok = true;
     if (m.kind == K_WAKEUP) {
       causal = e.mid;
@@ -681,6 +721,7 @@ bool Engine::run(Output& out) {
       if (r == 0) exchange_receive(e.t, e.sender, m);
       else ok = trader_receive(r, e.t, m);
     }
+    free_slots.push_back(e.payload);
     if (!ok) { out.error = error; return false; }
   }
   assemble();

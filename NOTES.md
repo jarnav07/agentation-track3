@@ -318,3 +318,57 @@ floating-point operation happens in the same order and precision as in NumPy / C
 | `timer.py` as06 (median, container wall) | **116,148 ev/s — 12.8×** baseline; 0.57 s per run |
 | self-reported `events_per_sec`, geomean over 65 | **2,268,476 — 179×** baseline (min 488k, max 3.94M) |
 | as06 engine time (local) | 33 ms vs 6.43 s baseline loop |
+
+### Step 4.3 — Start-up and output: a native `simulate` binary — KEPT
+
+**Measured problem.** Under Final's container-window timing (Docker `StartedAt → FinishedAt`) the
+C++-engine image spent ~440 ms on `as06`: ~95 ms is the container runtime itself (a no-op
+container), ~170 ms Python + NumPy + pyarrow imports, ~90 ms lazy imports and first-call costs, and
+only ~25 ms in the engine. Profiling the in-process remainder showed parquet writing (~50 ms) as
+the largest real cost.
+
+**Change.** `fastsim-native` (`csrc/native_main.cpp`) does everything without an interpreter:
+
+* scenario JSON parsed natively (`csrc/json.h`; Python `json` semantics: ints stay ints, last
+  duplicate key wins, `strtod` = correctly rounded `float()`);
+* `csrc/native_setup.cpp` mirrors `config.py` line by line with Python's `int()`/`float()`/
+  truthiness rules, and reproduces NumPy's **legacy seeding** — verified that `np.random.seed(s)`
+  and `RandomState(np.uint64(s))` are exactly `init_genrand(s)`;
+* **`np.log` hazard found and handled.** The baseline computes the log-normal `mu` as
+  `np.log(mean_ns)`. On this AVX-512 CPU, NumPy 1.26's float64 log is Intel **SVML**
+  (`__svml_log8`), which differs from libm `log` in ~27% of inputs (measured over 2.7 M values).
+  Using libm would silently change every latency draw. The native path vendors the exact SVML
+  routine NumPy 1.26.4 links (`csrc/svml/`, numpy/SVML @ `1b21e45`, BSD-3) and uses it when the
+  CPU has AVX512_SKX — NumPy's own dispatch condition — else libm, as NumPy does. Verified 0
+  mismatches against `np.log` over 1.6 M inputs;
+* parquet written by **the pyarrow wheel's own libarrow/libparquet** (linked from site-packages)
+  with `pyarrow.parquet.write_table`'s default writer properties and the same pandas metadata
+  string → identical bytes (checked also on a 300k-row table, where dictionary encoding falls back
+  to plain pages); the two files are written and hashed concurrently;
+* `simulate-batch` runs subs on a thread pool (one thread per available CPU, cgroup quota
+  respected) — the engine has no global state, so each sub is byte-identical to its isolated run;
+* **fallback:** anything the native setup is not sure about (non-numeric types, unknown agent
+  types, no `latency_config` → line-distance model, seed out of range, engine error) re-execs the
+  Python implementation, which is byte-identical by the same oracle. `FASTSIM_NO_FALLBACK=1` makes
+  the oracle runs prove the native path itself was used.
+
+Tried and **reverted**: Arrow's internal writer threading (`set_use_threads`) — byte-identical but
+slower at these sizes (thread-pool start-up > gain).
+
+**Deferred (not done):** a value-identical but not byte-identical writer (no dictionary, no
+compression) would cut writing by ~60% (as06: 45 → 18 ms in pyarrow). It would keep every scored
+value identical but lose SHA equality with the baseline; kept byte identity as the safer property.
+
+| check | result |
+|---|---|
+| `check_identical` local native, 65 × 3 seeds, fallback disabled | **195 / 195 byte-identical** |
+| as06 official window (StartedAt→FinishedAt, 5 runs) | **≈ 225 ms** (C++-engine Python image ≈ 440 ms; baseline ≈ 7,700 ms; no-op container ≈ 95 ms) |
+| as06 process, local | 94–124 ms total: engine 22–30 ms, write+hash ≈ 55 ms, library load ≈ 11 ms |
+
+### Step 4.4 — Engine micro-optimisations — KEPT
+
+callgrind on `as06` (instructions inside `run_engine`): heap operations, `memcpy` from payload
+copies and vector growth, the Gaussian draws, and out-of-line `push_back`s dominated. Changes: a
+4-ary heap, a chunked message pool read by reference (no payload copy per delivery), reserved
+output buffers. 120 M → 112 M instructions (−7%); `memcpy` halved. Byte-identical (195/195 local).
+Further engine work has low return now: the engine is ~25 ms of a ~200 ms container window.

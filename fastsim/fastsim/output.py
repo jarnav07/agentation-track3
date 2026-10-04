@@ -92,11 +92,34 @@ LEDGER_SCHEMA = pa.schema(
 
 
 def _dict_strings(codes: np.ndarray, names: tuple[str, ...]) -> pa.Array:
-    """A plain (non-dictionary) string array from small-int codes; code -1 → null."""
-    return pa.DictionaryArray.from_arrays(
-        pa.array(codes, type=pa.int32(), mask=codes < 0) if (codes < 0).any() else pa.array(codes, type=pa.int32()),
-        pa.array(list(names), type=pa.string()),
-    ).cast(pa.string())
+    """A plain string array from small-int codes into ``names``; code -1 -> null.
+
+    Built directly from offset / data buffers (vectorised byte gather), which avoids a dictionary
+    cast and with it the import of ``pyarrow.compute`` (~35 ms of start-up).
+    """
+    codes = np.asarray(codes, dtype=np.int32)
+    n = len(codes)
+    enc = [nm.encode() for nm in names]
+    width = max((len(b) for b in enc), default=1) or 1
+    table = np.zeros((len(enc) + 1, width), dtype=np.uint8)  # last row: null -> empty
+    lens = np.zeros(len(enc) + 1, dtype=np.int32)
+    for i, b in enumerate(enc):
+        table[i, : len(b)] = np.frombuffer(b, dtype=np.uint8)
+        lens[i] = len(b)
+    null = codes < 0
+    idx = np.where(null, len(enc), codes)
+    row_lens = lens[idx]
+    offsets = np.zeros(n + 1, dtype=np.int32)
+    np.cumsum(row_lens, out=offsets[1:])
+    mask = np.arange(width, dtype=np.int32)[None, :] < row_lens[:, None]
+    data = table[idx][mask]
+    validity = None
+    null_count = int(null.sum())
+    if null_count:
+        validity = pa.py_buffer(np.packbits(~null, bitorder="little"))
+    return pa.StringArray.from_buffers(
+        n, pa.py_buffer(offsets), pa.py_buffer(data), validity, null_count
+    )
 
 
 def write_trace(path, t_ns, agent_id, msg_code, msg_names, side_code, price, size, order_id) -> None:

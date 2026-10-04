@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ from typing import Any
 import pyarrow.parquet as pq
 
 REPO = Path(__file__).resolve().parent.parent
+RUN_TIMEOUT = 1800  # seconds per container run; --timeout overrides
 FILES = ("trace.parquet", "message_trace.parquet")
 EVENTS_FIELDS = (
     "scenario_id", "seed", "n_events", "wall_clock_sec", "events_per_sec", "trace_sha256",
@@ -81,13 +83,18 @@ def docker_simulate(image: str, scenario: dict[str, Any], out_dir: Path) -> tupl
     with tempfile.TemporaryDirectory() as tmp:
         inp = Path(tmp) / "scenario.json"
         inp.write_text(json.dumps(scenario, indent=2))
+        name = f"check-identical-{uuid.uuid4().hex[:12]}"
         cmd = [
-            "docker", "run", "--rm", "--network", "none", "--cpus", "4", "--memory", "16g",
+            "docker", "run", "--rm", "--name", name, "--network", "none", "--cpus", "4", "--memory", "16g",
             "-v", f"{tmp}:/input:ro", "-v", f"{out_dir.resolve()}:/output",
             image, "simulate", "--config", "/input/scenario.json", "--out", "/output/trace.parquet",
         ]
         t0 = time.perf_counter()
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=RUN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["docker", "kill", name], capture_output=True)
+            return 124, f"timed out after {RUN_TIMEOUT}s", time.perf_counter() - t0
         return proc.returncode, proc.stderr[-3000:], time.perf_counter() - t0
 
 
@@ -203,9 +210,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-own-seed", action="store_true", help="skip each scenario's own seed")
     ap.add_argument("--batch", action="store_true", help="also compare every batch unit per sub")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--timeout", type=int, default=1800, help="seconds per container run")
     ap.add_argument("--out-dir", default=str(REPO / "run_outputs" / "identical"))
     ap.add_argument("--cache-dir", default=str(REPO / "run_outputs" / "baseline_cache"))
     args = ap.parse_args(argv)
+    global RUN_TIMEOUT
+    RUN_TIMEOUT = args.timeout
     if bool(args.candidate_image) == bool(args.candidate_local):
         ap.error("give exactly one of --candidate-image / --candidate-local")
     if args.candidate_local and args.batch:
