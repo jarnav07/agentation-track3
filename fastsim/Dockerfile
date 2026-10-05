@@ -22,12 +22,20 @@ COPY csrc ./csrc
 COPY fastsim ./fastsim
 # Python extension (used by the fallback path) ...
 RUN python setup.py -q build_ext --inplace && ls fastsim/_engine*.so
-# ... and the native binary. No fast-math, no FMA contraction (floating-point order = NumPy's).
+# ... and the native binary, with profile-guided optimisation from a training run over pgo/*.json
+# (public scenarios; see pgo/README.md). No fast-math, no FMA contraction: the floating-point
+# sequence is NumPy's, so the profile changes code layout only, never output.
+COPY pgo ./pgo
 RUN PA=$(python -c "import pyarrow, os; print(os.path.dirname(pyarrow.__file__))") \
-    && g++ -O3 -std=c++17 -ffp-contract=off -fno-fast-math -w -I"$PA/include" \
-       csrc/native_main.cpp csrc/native_setup.cpp csrc/engine.cpp csrc/writer.cpp csrc/svml/svml_z0_log_d_la.s \
-       -L"$PA" -l:libarrow.so.1500 -l:libparquet.so.1500 -Wl,-rpath,"$PA" \
-       -static-libstdc++ -static-libgcc -o /src/fastsim-native
+    && CXXF="-O3 -std=c++17 -ffp-contract=off -fno-fast-math -w -I$PA/include" \
+    && LIBS="-L$PA -l:libarrow.so.1500 -l:libparquet.so.1500 -Wl,-rpath,$PA -static-libstdc++ -static-libgcc -pthread" \
+    && build() { out=$1; shift; mkdir -p obj; \
+         for f in native_main native_setup engine writer; do g++ $CXXF "$@" -c csrc/$f.cpp -o obj/$f.o || return 1; done; \
+         g++ "$@" obj/native_main.o obj/native_setup.o obj/engine.o obj/writer.o csrc/svml/svml_z0_log_d_la.s $LIBS -o $out; } \
+    && build /tmp/fastsim-train -fprofile-generate -fprofile-update=atomic \
+    && (for f in pgo/*.json; do /tmp/fastsim-train simulate --config $f --out /tmp/train/trace.parquet >/dev/null || exit 1; done \
+        || (echo "PGO training failed; building without a profile"; rm -f obj/*.gcda)) \
+    && build /src/fastsim-native -fprofile-use -fprofile-correction -Wno-missing-profile
 
 # ---- run-time stage ----------------------------------------------------------------------------
 FROM --platform=linux/amd64 python:3.11-slim@sha256:6f31d6e9ba2b0a787a3f81c37b004155b87b9efa1b771182bd550c1615745be5

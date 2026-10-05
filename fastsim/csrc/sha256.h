@@ -1,11 +1,128 @@
 // SHA-256 (FIPS 180-4), for the trace_sha256 / message_trace_sha256 fields of events.json.
 #pragma once
+#include <cpuid.h>
+#include <immintrin.h>
+
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
 namespace fastsim {
+
+// SHA-256 compression with the x86 SHA extensions (SHA-NI), used when the CPU has them; the
+// portable block() below otherwise. Same function, so the same digest. After the public-domain
+// reference by Jeffrey Walton / Sean Gulley (Intel).
+__attribute__((target("sha,sse4.1"))) inline void sha256_ni_blocks(uint32_t state[8], const uint8_t* data,
+                                                                     size_t nblocks) {
+  const __m128i MASK = _mm_set_epi64x(0x0c0d0e0f08090a0bULL, 0x0405060700010203ULL);
+  __m128i TMP = _mm_loadu_si128((const __m128i*)&state[0]);
+  __m128i STATE1 = _mm_loadu_si128((const __m128i*)&state[4]);
+  TMP = _mm_shuffle_epi32(TMP, 0xB1);           // CDAB
+  STATE1 = _mm_shuffle_epi32(STATE1, 0x1B);     // EFGH
+  __m128i STATE0 = _mm_alignr_epi8(TMP, STATE1, 8);  // ABEF
+  STATE1 = _mm_blend_epi16(STATE1, TMP, 0xF0);       // CDGH
+  while (nblocks--) {
+    const __m128i ABEF_SAVE = STATE0, CDGH_SAVE = STATE1;
+    __m128i MSG, MSG0, MSG1, MSG2, MSG3;
+    // rounds 0-3
+    MSG = _mm_loadu_si128((const __m128i*)(data + 0));
+    MSG0 = _mm_shuffle_epi8(MSG, MASK);
+    MSG = _mm_add_epi32(MSG0, _mm_set_epi64x(0xE9B5DBA5B5C0FBCFULL, 0x71374491428A2F98ULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    MSG = _mm_shuffle_epi32(MSG, 0x0E);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);
+    // rounds 4-7
+    MSG1 = _mm_loadu_si128((const __m128i*)(data + 16));
+    MSG1 = _mm_shuffle_epi8(MSG1, MASK);
+    MSG = _mm_add_epi32(MSG1, _mm_set_epi64x(0xAB1C5ED5923F82A4ULL, 0x59F111F13956C25BULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    MSG = _mm_shuffle_epi32(MSG, 0x0E);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);
+    MSG0 = _mm_sha256msg1_epu32(MSG0, MSG1);
+    // rounds 8-11
+    MSG2 = _mm_loadu_si128((const __m128i*)(data + 32));
+    MSG2 = _mm_shuffle_epi8(MSG2, MASK);
+    MSG = _mm_add_epi32(MSG2, _mm_set_epi64x(0x550C7DC3243185BEULL, 0x12835B01D807AA98ULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    MSG = _mm_shuffle_epi32(MSG, 0x0E);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);
+    MSG1 = _mm_sha256msg1_epu32(MSG1, MSG2);
+    // rounds 12-15
+    MSG3 = _mm_loadu_si128((const __m128i*)(data + 48));
+    MSG3 = _mm_shuffle_epi8(MSG3, MASK);
+    MSG = _mm_add_epi32(MSG3, _mm_set_epi64x(0xC19BF1749BDC06A7ULL, 0x80DEB1FE72BE5D74ULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    TMP = _mm_alignr_epi8(MSG3, MSG2, 4);
+    MSG0 = _mm_add_epi32(MSG0, TMP);
+    MSG0 = _mm_sha256msg2_epu32(MSG0, MSG3);
+    MSG = _mm_shuffle_epi32(MSG, 0x0E);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);
+    MSG2 = _mm_sha256msg1_epu32(MSG2, MSG3);
+#define FASTSIM_SHA_QROUND(MA, MB, MC, MD, K1, K0)                     \
+    MSG = _mm_add_epi32(MA, _mm_set_epi64x(K1, K0));                    \
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);                \
+    TMP = _mm_alignr_epi8(MA, MD, 4);                                   \
+    MB = _mm_add_epi32(MB, TMP);                                        \
+    MB = _mm_sha256msg2_epu32(MB, MA);                                  \
+    MSG = _mm_shuffle_epi32(MSG, 0x0E);                                 \
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);                \
+    MD = _mm_sha256msg1_epu32(MD, MA);
+    // rounds 16-51 (message schedule in flight)
+    FASTSIM_SHA_QROUND(MSG0, MSG1, MSG2, MSG3, 0x240CA1CC0FC19DC6ULL, 0xEFBE4786E49B69C1ULL)
+    FASTSIM_SHA_QROUND(MSG1, MSG2, MSG3, MSG0, 0x76F988DA5CB0A9DCULL, 0x4A7484AA2DE92C6FULL)
+    FASTSIM_SHA_QROUND(MSG2, MSG3, MSG0, MSG1, 0xBF597FC7B00327C8ULL, 0xA831C66D983E5152ULL)
+    FASTSIM_SHA_QROUND(MSG3, MSG0, MSG1, MSG2, 0x1429296706CA6351ULL, 0xD5A79147C6E00BF3ULL)
+    FASTSIM_SHA_QROUND(MSG0, MSG1, MSG2, MSG3, 0x53380D134D2C6DFCULL, 0x2E1B213827B70A85ULL)
+    FASTSIM_SHA_QROUND(MSG1, MSG2, MSG3, MSG0, 0x92722C8581C2C92EULL, 0x766A0ABB650A7354ULL)
+    FASTSIM_SHA_QROUND(MSG2, MSG3, MSG0, MSG1, 0xC76C51A3C24B8B70ULL, 0xA81A664BA2BFE8A1ULL)
+    FASTSIM_SHA_QROUND(MSG3, MSG0, MSG1, MSG2, 0x106AA070F40E3585ULL, 0xD6990624D192E819ULL)
+    FASTSIM_SHA_QROUND(MSG0, MSG1, MSG2, MSG3, 0x34B0BCB52748774CULL, 0x1E376C0819A4C116ULL)
+#undef FASTSIM_SHA_QROUND
+    // rounds 52-55
+    MSG = _mm_add_epi32(MSG1, _mm_set_epi64x(0x682E6FF35B9CCA4FULL, 0x4ED8AA4A391C0CB3ULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    TMP = _mm_alignr_epi8(MSG1, MSG0, 4);
+    MSG2 = _mm_add_epi32(MSG2, TMP);
+    MSG2 = _mm_sha256msg2_epu32(MSG2, MSG1);
+    MSG = _mm_shuffle_epi32(MSG, 0x0E);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);
+    // rounds 56-59
+    MSG = _mm_add_epi32(MSG2, _mm_set_epi64x(0x8CC7020884C87814ULL, 0x78A5636F748F82EEULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    TMP = _mm_alignr_epi8(MSG2, MSG1, 4);
+    MSG3 = _mm_add_epi32(MSG3, TMP);
+    MSG3 = _mm_sha256msg2_epu32(MSG3, MSG2);
+    MSG = _mm_shuffle_epi32(MSG, 0x0E);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);
+    // rounds 60-63
+    MSG = _mm_add_epi32(MSG3, _mm_set_epi64x(0xC67178F2BEF9A3F7ULL, 0xA4506CEB90BEFFFAULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    MSG = _mm_shuffle_epi32(MSG, 0x0E);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);
+    STATE0 = _mm_add_epi32(STATE0, ABEF_SAVE);
+    STATE1 = _mm_add_epi32(STATE1, CDGH_SAVE);
+    data += 64;
+  }
+  TMP = _mm_shuffle_epi32(STATE0, 0x1B);        // FEBA
+  STATE1 = _mm_shuffle_epi32(STATE1, 0xB1);     // DCHG
+  STATE0 = _mm_blend_epi16(TMP, STATE1, 0xF0);  // DCBA
+  STATE1 = _mm_alignr_epi8(STATE1, TMP, 8);     // HGFE
+  _mm_storeu_si128((__m128i*)&state[0], STATE0);
+  _mm_storeu_si128((__m128i*)&state[4], STATE1);
+}
+
+inline bool cpu_has_sha_ni() {
+  static const bool has = [] {
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 19))) return false;  // SSE4.1
+    if (__get_cpuid_max(0, nullptr) < 7) return false;
+    __cpuid_count(7, 0, a, b, c, d);
+    return (b & (1u << 29)) != 0 && !std::getenv("FASTSIM_NO_SHANI");      // SHA
+  }();
+  return has;
+}
 
 class Sha256 {
  public:
@@ -19,6 +136,12 @@ class Sha256 {
   }
   void update(const uint8_t* p, size_t n) {
     len_ += n;
+    if (fill_ == 0 && n >= 64) {  // whole blocks straight from the input
+      const size_t nb = n / 64;
+      blocks(p, nb);
+      p += nb * 64;
+      n -= nb * 64;
+    }
     while (n) {
       size_t take = 64 - fill_ < n ? 64 - fill_ : n;
       std::memcpy(buf_ + fill_, p, take);
@@ -26,7 +149,7 @@ class Sha256 {
       p += take;
       n -= take;
       if (fill_ == 64) {
-        block(buf_);
+        blocks(buf_, 1);
         fill_ = 0;
       }
     }
@@ -51,6 +174,13 @@ class Sha256 {
   uint8_t buf_[64];
   size_t fill_;
   static uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+  void blocks(const uint8_t* p, size_t nb) {
+    if (cpu_has_sha_ni()) {
+      sha256_ni_blocks(h_, p, nb);
+      return;
+    }
+    for (size_t i = 0; i < nb; i++) block(p + 64 * i);
+  }
   void block(const uint8_t* b) {
     static const uint32_t k[64] = {
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,

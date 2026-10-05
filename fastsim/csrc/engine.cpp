@@ -99,7 +99,18 @@ struct Level {
   int64_t total;  // visible quantity (PriceLevel.total_quantity)
 };
 
+// Pre-drawn per-agent RNG values (see Engine::act): an agent's stream is consumed in a fixed
+// per-action pattern, so a block can be drawn ahead in one tight loop.
+struct NoiseDraw {
+  int64_t size, offset;
+  bool buy;
+};
+constexpr int kAgentBlock = 16;
+
 struct Trader {
+  NoiseDraw nblk[kAgentBlock];
+  double gblk[kAgentBlock];
+  int npos = kAgentBlock, gpos = kAgentBlock;
   bool hours_known = false, first_wake = true, mkt_closed = false, awaiting_spread = false;
   int64_t known_bid = 0, known_ask = 0;
   std::vector<int64_t> open;   // oids in insertion order (lazy deletion)
@@ -381,10 +392,22 @@ class Engine {
     pf_on = false;
   }
 
+  // The latency stream is consumed in a fixed order, independent of the simulation state, so it
+  // is drawn in blocks: a tight loop of independent draws overlaps the libm calls far better than
+  // one draw per message interleaved with event handling. Only the consumption order matters.
+  static constexpr int kLatBlock = 256;
+  int64_t lat_blk[kLatBlock];
+  int lat_pos = kLatBlock;
+  __attribute__((noinline)) void lat_refill() {
+    for (int i = 0; i < kLatBlock; i++) lat_blk[i] = draw_latency();
+    lat_pos = 0;
+  }
   int64_t get_latency(int32_t s, int32_t r) {
     if (S.lat_model == L_MATRIX) return S.lat_matrix[(size_t)s * S.n_agents + r];
     if (s == r) return 0;
-    return draw_latency();
+    if (S.lat_model == L_DET) return draw_latency();
+    if (__builtin_expect(lat_pos == kLatBlock, 0)) lat_refill();
+    return lat_blk[lat_pos++];
   }
 
   // Kernel.send_message (+ ledger patch). The payload's message fields must already be set.
@@ -710,10 +733,20 @@ class Engine {
     MT19937& rs = S.rngs[2 + a];
     switch (P.kind) {
       case A_NOISE: {
-        int64_t size = py_round(rs.normal(P.order_size_mean, P.order_size_std));
-        if (size < 1) size = 1;
-        bool buy = rs.randint(0, 2) != 0;
-        int64_t offset = rs.randint(0, P.price_offset_ticks + 1);
+        // One action draws normal, randint(0, 2), randint(0, offset + 1), always in that order.
+        if (T.npos == kAgentBlock) {
+          for (int k = 0; k < kAgentBlock; k++) {
+            NoiseDraw& d = T.nblk[k];
+            d.size = py_round(rs.normal(P.order_size_mean, P.order_size_std));
+            if (d.size < 1) d.size = 1;
+            d.buy = rs.randint(0, 2) != 0;
+            d.offset = rs.randint(0, P.price_offset_ticks + 1);
+          }
+          T.npos = 0;
+        }
+        const NoiseDraw& d = T.nblk[T.npos++];
+        const int64_t size = d.size, offset = d.offset;
+        const bool buy = d.buy;
         if (buy) {
           int64_t anchor = ask ? ask : (bid ? bid : P.reference_price);
           place_limit_order(a, t, size, true, anchor + offset);
@@ -749,7 +782,7 @@ class Engine {
         else if (bid) mid = (double)bid;
         else if (ask) mid = (double)ask;
         else return;
-        int64_t fundamental = observe_price(t, rs, P.sigma_n);
+        int64_t fundamental = observe_price(t, T, rs, P.sigma_n);
         if (mid < (double)(fundamental - P.threshold_ticks) && ask)
           place_limit_order(a, t, P.size, true, ask);
         else if (mid > (double)(fundamental + P.threshold_ticks) && bid)
@@ -816,10 +849,15 @@ class Engine {
     return compute_fundamental(false, current_time, 0.0, false, 0.0);
   }
 
-  int64_t observe_price(int64_t t, MT19937& rs, double sigma_n) {
+  int64_t observe_price(int64_t t, Trader& T, MT19937& rs, double sigma_n) {
     int64_t r_t = advance_fundamental(t >= S.mkt_close ? S.mkt_close - 1 : t);
     if (sigma_n == 0) return r_t;
-    return py_round(rs.normal((double)r_t, std::sqrt(sigma_n)));
+    // normal(loc, scale) == loc + scale * std_gauss(); the agent's stream is only ever gaussians
+    if (T.gpos == kAgentBlock) {
+      for (int k = 0; k < kAgentBlock; k++) T.gblk[k] = rs.std_gauss();
+      T.gpos = 0;
+    }
+    return py_round((double)r_t + std::sqrt(sigma_n) * T.gblk[T.gpos++]);
   }
 
   void assemble();
@@ -1139,6 +1177,7 @@ bool parse_spec(const char* buf, size_t len, Spec& s, std::string& err) {
     m.pos = R.get<int32_t>();
     m.has_gauss = R.get<int32_t>();
     m.gauss = R.get<double>();
+    m.temper_all();
   }
   if (!R.ok || R.p != R.end) {
     err = "spec length mismatch";

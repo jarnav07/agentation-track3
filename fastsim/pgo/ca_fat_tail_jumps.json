@@ -1,0 +1,124 @@
+{
+  "scenario_id": "683a0b4e-a386-5a7d-a8b2-e252cc6d9f7f",
+  "description": "Calibration & public-data realism (CA): a mixed ABIDES ecology (2 MarketMakers posting a two-sided ladder + ValueTrader/MomentumTrader marketable flow + NoiseTraders) tuned so the simulated mid-price reproduces the four empirical stylized facts (heavy-tailed returns, volatility clustering, tail index, top-of-book depth distribution) within the Family-5 ceilings. Scored Tier-B statistical + g3(b) stylized-fact admissibility (ks<=0.08, acf_abs_l2<=0.12, hill_abs<=1.5, depth_js<=0.10).",
+  "scenario_family": "calibration-stylized-facts",
+  "schema_version": 2,
+  "seed": 546456587,
+  "horizon_ns": 12000000000,
+  "agent_mix": {
+    "NoiseTrader": 12,
+    "ValueTrader": 4,
+    "MomentumTrader": 3,
+    "MarketMaker": 2
+  },
+  "exchange_config": {
+    "symbol": "SYM",
+    "tick_size": 1,
+    "lot_size": 1,
+    "min_price": 1,
+    "max_price": 1000000,
+    "stp_policy": "cancel_newest",
+    "order_types_allowed": [
+      "LIMIT",
+      "MARKET",
+      "CANCEL",
+      "REPLACE"
+    ]
+  },
+  "oracle_config": {
+    "type": "mean_reverting",
+    "params": {
+      "initial_price": 100000,
+      "kappa": 0.05,
+      "sigma": 0.001,
+      "dt_ns": 1000000,
+      "noise_type": "gaussian",
+      "jump_intensity": 1.5,
+      "jump_sigma": 300.0
+    }
+  },
+  "latency_config": {
+    "model": "log_normal",
+    "params": {
+      "mean_ns": 5000,
+      "sigma": 0.75,
+      "min_ns": 100,
+      "max_ns": 20000000
+    }
+  },
+  "agent_configs": [
+    {
+      "agent_type": "NoiseTrader",
+      "count": 12,
+      "params": {
+        "order_size_mean": 8,
+        "order_size_std": 2,
+        "arrival_rate_hz": 20.0,
+        "price_offset_ticks": 5
+      }
+    },
+    {
+      "agent_type": "ValueTrader",
+      "count": 4,
+      "params": {
+        "fundamental_value_source": "oracle",
+        "order_size_mean": 30,
+        "threshold_ticks": 3,
+        "arrival_rate_hz": 3.0
+      }
+    },
+    {
+      "agent_type": "MomentumTrader",
+      "count": 3,
+      "params": {
+        "order_size_mean": 20,
+        "threshold_ticks": 3,
+        "lookback": 5,
+        "arrival_rate_hz": 3.0
+      }
+    },
+    {
+      "agent_type": "MarketMaker",
+      "count": 2,
+      "params": {
+        "spread_ticks": 4,
+        "depth_levels": 5,
+        "size_per_level": 20,
+        "rebalance_interval_ns": 50000000
+      }
+    }
+  ],
+  "output_config": {
+    "trace_cols": [
+      "t_ns",
+      "agent_id",
+      "msg_type",
+      "side",
+      "price",
+      "size",
+      "order_id"
+    ],
+    "events_fields": [
+      "scenario_id",
+      "n_events",
+      "wall_clock_sec",
+      "events_per_sec",
+      "seed",
+      "trace_sha256"
+    ],
+    "snapshot_interval_ns": 0
+  },
+  "tolerance": {
+    "tier": "B",
+    "timestamp_tolerance_ns": 1000,
+    "kendall_tau_floor": 0.999,
+    "spread_bps_tolerance": 10.0,
+    "oracle_rmse_tolerance_pct": 20.0,
+    "stylized_fact_ceilings": {
+      "ks": 0.08,
+      "acf_abs_l2": 0.12,
+      "hill_abs": 1.5,
+      "depth_js": 0.1
+    }
+  }
+}

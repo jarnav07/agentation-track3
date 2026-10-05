@@ -10,12 +10,23 @@
 #include <cstdint>
 #include <cstring>
 
+// glibc's exp/log cores without the errno wrapper (same ifunc-selected routine as exp()/log(), so
+// bit-identical results; tests/test_rng.py and the byte-equality oracle check the streams).
+__asm__(".symver fs_exp_finite,__exp_finite@GLIBC_2.15");
+__asm__(".symver fs_log_finite,__log_finite@GLIBC_2.15");
+extern "C" double fs_exp_finite(double);
+extern "C" double fs_log_finite(double);
+
 namespace fastsim {
+
+inline double rng_exp(double x) { return fs_exp_finite(x); }
+inline double rng_log(double x) { return fs_log_finite(x); }
 
 struct MT19937 {
   static constexpr int N = 624;
   static constexpr int M = 397;
   uint32_t key[N];
+  uint32_t out[N];  // tempered key (valid for the current block; see temper_all)
   int pos = N;
   int has_gauss = 0;
   double gauss = 0.0;
@@ -34,17 +45,25 @@ struct MT19937 {
     }
     y = (key[N - 1] & UPPER) | (key[0] & LOWER);
     key[N - 1] = key[M - 1] ^ (y >> 1) ^ (-(y & 1) & MATRIX_A);
+    temper_all();
     pos = 0;
+  }
+  // Temper the whole block at once (a vectorisable loop) so a draw is a load. Must be called after
+  // the key is set from outside with pos < N.
+  void temper_all() {
+    for (int i = 0; i < N; i++) {
+      uint32_t y = key[i];
+      y ^= (y >> 11);
+      y ^= (y << 7) & 0x9d2c5680U;
+      y ^= (y << 15) & 0xefc60000U;
+      y ^= (y >> 18);
+      out[i] = y;
+    }
   }
 
   inline uint32_t next32() {
-    if (pos == N) refill();
-    uint32_t y = key[pos++];
-    y ^= (y >> 11);
-    y ^= (y << 7) & 0x9d2c5680U;
-    y ^= (y << 15) & 0xefc60000U;
-    y ^= (y >> 18);
-    return y;
+    if (__builtin_expect(pos == N, 0)) refill();
+    return out[pos++];
   }
 
   inline uint64_t next64() {
@@ -72,7 +91,7 @@ struct MT19937 {
       x2 = 2.0 * next_double() - 1.0;
       r2 = x1 * x1 + x2 * x2;
     } while (r2 >= 1.0 || r2 == 0.0);
-    f = std::sqrt(-2.0 * std::log(r2) / r2);
+    f = std::sqrt(-2.0 * rng_log(r2) / r2);
     gauss = f * x1;
     has_gauss = 1;
     return f * x2;
@@ -81,18 +100,18 @@ struct MT19937 {
   // RandomState.normal(loc, scale)
   inline double normal(double loc, double scale) { return loc + scale * std_gauss(); }
   // RandomState.lognormal(mean, sigma)
-  inline double lognormal(double mean, double sigma) { return std::exp(normal(mean, sigma)); }
+  inline double lognormal(double mean, double sigma) { return rng_exp(normal(mean, sigma)); }
   // RandomState.uniform(low, high): low + (high - low) * U   (range computed first, as NumPy does)
   inline double uniform(double low, double high) {
     const double range = high - low;
     return low + range * next_double();
   }
   // legacy_standard_exponential: -log(1 - U)
-  inline double std_exponential() { return -std::log(1.0 - next_double()); }
+  inline double std_exponential() { return -rng_log(1.0 - next_double()); }
   // RandomState.exponential(scale)
   inline double exponential(double scale) { return scale * std_exponential(); }
   // RandomState.pareto(a): exp(E / a) - 1
-  inline double pareto(double a) { return std::exp(std_exponential() / a) - 1; }
+  inline double pareto(double a) { return rng_exp(std_exponential() / a) - 1; }
 
   // RandomState.randint(low, high) for the default int64 dtype: masked rejection sampling on the
   // inclusive range rng = high - 1 - low. rng == 0 consumes nothing.

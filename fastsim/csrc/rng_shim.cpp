@@ -9,6 +9,7 @@ void draw(const uint32_t* key, int pos, int has_gauss, double gauss, int kind, d
   MT19937 mt;
   std::memcpy(mt.key, key, sizeof(mt.key));
   mt.pos = pos; mt.has_gauss = has_gauss; mt.gauss = gauss;
+  mt.temper_all();
   for (int i = 0; i < n; i++) {
     switch (kind) {
       case 0: out[i] = mt.next_double(); break;

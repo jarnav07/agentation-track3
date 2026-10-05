@@ -478,3 +478,39 @@ messages are in flight); branch-free 128-bit key compares (more instructions).
 Where the remaining loop time goes (as06, instructions): RNG (bit-exact MT19937 + glibc
 `log`/`exp`) ~25%, order handling/book ~25%, queue ~15%, record writing ~10%. Reaching the 10M cap
 on every unit would need roughly another 1.6× on the loop.
+
+---
+
+## Phase 7 — Third speed pass (image build `n5`)
+
+**Executive summary.** Development scored build `n4` at 4.6M events/s (mean over 71 units). This
+pass makes the simulation loop ~15–20% faster again and hashes output files ~4× faster, still
+byte-identical. Locally, the single-scenario mean (one run per unit, like Development) went from
+7.1M to 7.3M for the PGO step alone, and from 6.4M to 7.4M for the whole pass.
+
+| change | why it is exact |
+|---|---|
+| Latency draws generated in blocks of 256 | The latency stream (`rngs[2]`) is consumed in a fixed order whatever the simulation does, so drawing ahead changes nothing but when the work happens; a tight loop of independent draws overlaps the libm calls (~10–14% loop time) |
+| Noise-trader actions and value-trader observations pre-drawn per agent (blocks of 16) | Each agent's stream is consumed in a fixed per-action pattern (normal, randint, randint / one gaussian); `normal(loc, s) == loc + s * std_gauss()` exactly |
+| MT19937 tempers a whole 624-word block at once | Same outputs; a draw becomes a load |
+| `__exp_finite` / `__log_finite` instead of `exp` / `log` | glibc's same ifunc-selected cores without the errno wrapper; 0 mismatches over 2×10⁸ inputs, `tests/test_rng.py` passes |
+| SHA-256 with the SHA-NI instructions when present | Same digest (checked against `sha256sum`, edge lengths 0–128 and large files); 40 ms → 9 ms for a 9.7 MB file — counts in batch units' timer and in Final's container window |
+| PGO in the Docker build (`fastsim/pgo/`, 10 public scenarios) | Code layout only; floating-point flags unchanged. Falls back to a plain build if the training run fails |
+
+Tried and dropped: an x86-64-v3 (AVX2) build behind a CPU-dispatching launcher (+0.3%, not worth
+a second binary).
+
+### Checks on build `n5`
+
+| check | result |
+|---|---|
+| image oracle, 65 × 3 seeds + 6 batch units | **201 / 201 byte-identical** |
+| edge cases through the image (22 × 2 seeds) | **44 / 44** |
+| `run_regression.py` | **65 / 65 PASS** |
+| batch units | **6 / 6 PASS** |
+| `tests/test_rng.py` | pass |
+
+| metric (this sandbox) | `n4` | `n5` |
+|---|---|---|
+| self-reported eps, mean over 65 units, in-container (regression run) | 6.10M | **7.40M** |
+| batch units, in-container | 0.97M–1.50M | **1.57M–2.24M** |
