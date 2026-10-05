@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "big_alloc.h"
 #include "rng.h"
 
 namespace fastsim {
@@ -64,20 +65,24 @@ struct Spec {
   std::vector<AgentParams> agents;  // index = agent id; [0] unused
   // RNG streams: [0] global, [1] oracle, [2] latency, [3 + i] agent i+1
   std::vector<MT19937> rngs;
+  // Spare cores the engine may use for helper work (page pre-faulting); results never depend on it.
+  int helper_threads = 0;
 };
 
 struct Output {
   // trace (final order)
-  std::vector<int64_t> t_ns, price, size, order_id;
-  std::vector<int32_t> agent_id, msg_code, side_code;
+  bvec<int64_t> t_ns, price, size, order_id;
+  bvec<int32_t> agent_id, msg_code, side_code;
   // ledger (seq order)
-  std::vector<int64_t> l_t_recv, l_t_send, l_latency, l_msg_id, l_order_id, l_causal;
-  std::vector<int32_t> l_src, l_dst, l_kind;
-  std::vector<uint8_t> l_t_send_valid, l_order_valid, l_causal_valid;
+  bvec<int64_t> l_t_recv, l_t_send, l_latency, l_msg_id, l_order_id, l_causal;
+  bvec<int32_t> l_src, l_dst, l_kind;
+  bvec<uint8_t> l_t_send_valid, l_order_valid, l_causal_valid;
   std::string error;
 };
 
 bool parse_spec(const char* buf, size_t len, Spec& spec, std::string& err);
-bool run_engine(Spec& spec, Output& out);
+// sim_sec (optional): seconds spent in the event loop alone, excluding the trace assembly that
+// follows it -- the same boundary the baseline times (abides.run, before extract_trace).
+bool run_engine(Spec& spec, Output& out, double* sim_sec = nullptr);
 
 }  // namespace fastsim

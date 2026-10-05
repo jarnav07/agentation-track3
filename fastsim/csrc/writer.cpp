@@ -46,19 +46,19 @@ const char* kKindNames[] = {"AGENT_WAKEUP", "MarketClosePriceRequestMsg", "Marke
                             "OrderAcceptedMsg", "OrderExecutedMsg", "OrderCancelledMsg", "MarketClosedMsg",
                             "MarketClosePriceMsg"};
 
-template <typename T>
-std::shared_ptr<arrow::Buffer> wrap(const std::vector<T>& v) {
+template <typename V>
+std::shared_ptr<arrow::Buffer> wrap(const V& v) {
   return arrow::Buffer::Wrap(v.data(), v.size());
 }
 
-template <typename ArrowType, typename T>
-std::shared_ptr<arrow::Array> prim(const std::vector<T>& v) {
+template <typename ArrowType, typename V>
+std::shared_ptr<arrow::Array> prim(const V& v) {
   auto data = arrow::ArrayData::Make(std::make_shared<ArrowType>(), (int64_t)v.size(), {nullptr, wrap(v)}, 0);
   return arrow::MakeArray(data);
 }
 
 // int64 with a validity vector (1 = valid); bitmap only when something is null.
-std::shared_ptr<arrow::Array> nullable_i64(const std::vector<int64_t>& v, const std::vector<uint8_t>& valid,
+std::shared_ptr<arrow::Array> nullable_i64(const bvec<int64_t>& v, const bvec<uint8_t>& valid,
                                            std::vector<uint8_t>& bitmap_storage) {
   const int64_t n = (int64_t)v.size();
   int64_t nulls = 0;
@@ -75,12 +75,12 @@ std::shared_ptr<arrow::Array> nullable_i64(const std::vector<int64_t>& v, const 
 }
 
 struct StrStorage {
-  std::vector<int32_t> offsets;
-  std::vector<char> chars;
+  bvec<int32_t> offsets;
+  bvec<char> chars;
 };
 
 // Plain utf8 array from codes into a name table (no nulls: every code is valid here).
-std::shared_ptr<arrow::Array> strings(const std::vector<int32_t>& codes, const char* const* names, int n_names,
+std::shared_ptr<arrow::Array> strings(const bvec<int32_t>& codes, const char* const* names, int n_names,
                                       StrStorage& st) {
   std::vector<int32_t> lens(n_names);
   for (int k = 0; k < n_names; k++) lens[k] = (int32_t)std::strlen(names[k]);
@@ -157,7 +157,7 @@ bool write_trace_parquet(const Output& o, const std::string& path, std::string& 
 
 bool write_ledger_parquet(const Output& o, const std::string& path, std::string& err) {
   const size_t n = o.l_t_recv.size();
-  std::vector<int64_t> seq(n);
+  bvec<int64_t> seq(n);
   for (size_t i = 0; i < n; i++) seq[i] = (int64_t)i;
   std::vector<uint8_t> bm1, bm2, bm3;
   StrStorage s_kind;

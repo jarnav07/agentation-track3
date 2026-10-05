@@ -184,10 +184,12 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   r.seed = meta.seed;
   Output out;
   auto t0 = std::chrono::steady_clock::now();
-  bool ok = run_engine(spec, out);
+  double sim_sec = 0.0;
+  bool ok = run_engine(spec, out, &sim_sec);
   auto t1 = std::chrono::steady_clock::now();
   if (!ok) { r.error = "engine: " + out.error; return false; }
-  r.wall = std::chrono::duration<double>(t1 - t0).count();
+  // Same boundary as the baseline: the simulation loop only (abides.run), not trace extraction.
+  r.wall = sim_sec;
   r.n_events = (int64_t)out.t_ns.size();
   r.n_messages = (int64_t)out.l_t_recv.size();
   std::string dir = parent_of(trace_path);
@@ -209,7 +211,7 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   auto t3 = std::chrono::steady_clock::now();
   if (std::getenv("FASTSIM_TIMING")) {
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    std::fprintf(stderr, "fastsim-native timing: engine %.1f ms, write+sha %.1f ms\n", ms(t0, t1), ms(t2, t3));
+    std::fprintf(stderr, "fastsim-native timing: loop %.1f ms, loop+assemble %.1f ms, write+sha %.1f ms\n", sim_sec * 1e3, ms(t0, t1), ms(t2, t3));
   }
   std::string ev = events_json(r);
   FILE* f = std::fopen((dir + "/events.json").c_str(), "wb");
@@ -259,6 +261,30 @@ int cmd_simulate(int argc, char** argv) {
   ScenarioMeta meta;
   std::string why;
   if (!prepare(config, seed, spec, meta, why)) fallback("fastsim.simulate", why);
+  // Spare cores do helper work (page pre-faulting). Off in batch mode, where every core already
+  // runs a sub-scenario.
+  if (!std::getenv("FASTSIM_NO_HELPERS")) spec.helper_threads = available_cpus() - 1;
+  if (const char* nb = std::getenv("FASTSIM_BENCH")) {  // developer A/B timing: min over N runs
+    double best = 1e9, best_all = 1e9;
+    for (int k = 0, nk = std::atoi(nb); k < nk; k++) {
+      Spec c = spec;
+      Output o;
+      double sec = 0;
+      auto a0 = std::chrono::steady_clock::now();
+      struct rusage u0, u1;
+      getrusage(RUSAGE_SELF, &u0);
+      run_engine(c, o, &sec);
+      getrusage(RUSAGE_SELF, &u1);
+      if (k == 0)
+        std::fprintf(stderr, "bench: run %d minflt %ld utime %.2f ms stime %.2f ms\n", k, u1.ru_minflt - u0.ru_minflt,
+                     (u1.ru_utime.tv_sec - u0.ru_utime.tv_sec) * 1e3 + (u1.ru_utime.tv_usec - u0.ru_utime.tv_usec) / 1e3,
+                     (u1.ru_stime.tv_sec - u0.ru_stime.tv_sec) * 1e3 + (u1.ru_stime.tv_usec - u0.ru_stime.tv_usec) / 1e3);
+      double all = std::chrono::duration<double>(std::chrono::steady_clock::now() - a0).count();
+      best = std::min(best, sec);
+      best_all = std::min(best_all, all);
+    }
+    std::fprintf(stderr, "bench: min loop %.2f ms, min loop+assemble %.2f ms\n", best * 1e3, best_all * 1e3);
+  }
   RunResult r;
   if (!run_one(spec, meta, out, r)) fallback("fastsim.simulate", r.error);
   std::string dir = parent_of(out);

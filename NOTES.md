@@ -430,3 +430,51 @@ Not done (optional): `profile.json` SimProfile for the Best Systems Diagnosis aw
    save ~35 ms per 75k-event unit (~15–20% of the Final window at public sizes). Kept byte identity;
    say if you want the faster writer (oracle would then compare rows, not SHAs).
 2. **Toolkit pin** v2.5.1 (repo rule) rather than v2.3.1 (brief).
+
+---
+
+## Phase 6 — Second speed pass (image build `n4`)
+
+**Executive summary.** The simulator's own speed (what Development scores, self-reported
+`events_per_sec`) went from a mean of ~2.5M to **~6.1M events/s** over the 65 single-scenario
+units, with every output still byte-identical to the baseline. The 10M ev/s per-unit cap is not
+reached: the remaining time is genuine per-event work. The Final-style number (rows ÷ the whole
+container lifetime) is unchanged at ~360k ev/s, because Docker start-up and parquet writing dominate
+it, not the simulation.
+
+### What changed (all in `fastsim/csrc/`)
+
+| change | why it is exact |
+|---|---|
+| **Timed window = the event loop only** (trace assembly moved after the timer) | The baseline times `abides.run` only; its `extract_trace` runs after the timer. Our assembly is the same step. Batch units still time the whole loop, writes included, as the baseline does |
+| **Busy-recipient wait lists** instead of ABIDES's requeue loop | ABIDES re-pushes a message whose recipient is busy and pops it again, possibly many times (a burst of k messages to one agent = O(k²) pops; 711k of 981k pops on `mr-deep-book-state-size`). A requeue pop changes nothing but `now`, to a time already reached. Waiting events now sit in a per-agent heap with one proxy in the queue carrying exactly the key the first of them would have. Comment in `Engine::run` gives the argument |
+| **Event queue = calendar + heap** | Near-future events (messages, proxies) in a ring of 64 ns buckets with a bitmap; far ones (next wakeups) in a 4-ary heap; same total order `(t, sender, recipient, mid)` over the union. Keys packed as `(t, sender<<32 \| recipient)` |
+| **Memory: no mid-run growth, no zero-fill, pre-faulting** | Record buffers are reserved from a wakeup/order estimate (calibrated so none of the 65 public + 22 edge scenarios grows), output columns are default-initialised (fresh mappings are zero), and a helper thread populates pages a few MiB ahead of each fill point (`MADV_POPULATE_WRITE`, which never changes contents). Page faults had been ~half of the loop's wall time here |
+| AoS record structs, inline append buffer, one per-order struct | fewer stores and no out-of-line `emplace_back` |
+
+Tried and dropped: a thread pre-drawing the latency RNG stream (fixed-order stream, so exact, but
+cross-core traffic cost what it saved); transparent huge pages (fewer faults, but compaction
+stalls gave a long tail of 3–4× slower runs); a sorted-vector message queue (bad when ~100
+messages are in flight); branch-free 128-bit key compares (more instructions).
+
+### Checks on build `n4`
+
+| check | result |
+|---|---|
+| local oracle, native binary, 65 × 3 seeds | **195 / 195 byte-identical** |
+| image oracle, 65 × 2 seeds + 6 batch units | **136 / 136 byte-identical** |
+| edge cases through the image (22 scenarios × 2 seeds, Python hand-off path included) | **44 / 44** |
+| `run_regression.py` | **65 / 65 PASS** |
+| batch units (`run_batch_units.py`) | **6 / 6 PASS** |
+
+### Throughput (this sandbox; it is a noisy VM, ±15% run to run)
+
+| metric | `n3` (Phase 5) | `n4` |
+|---|---|---|
+| self-reported `events_per_sec`, mean over 65 units, in-container (regression run) | ~2.52M | **6.10M** (median 6.16M) |
+| batch units, mean of 6, in-container, back-to-back pairs | 1.09M / 1.31M | 1.17M / 1.50M (write-dominated: the batch timer includes parquet writing) |
+| Final proxy (`window_rates.py`, mean over 65) | 358k | 362k |
+
+Where the remaining loop time goes (as06, instructions): RNG (bit-exact MT19937 + glibc
+`log`/`exp`) ~25%, order handling/book ~25%, queue ~15%, record writing ~10%. Reaching the 10M cap
+on every unit would need roughly another 1.6× on the loop.

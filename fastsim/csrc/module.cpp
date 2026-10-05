@@ -4,9 +4,10 @@
 
 #include "engine.h"
 
-template <typename T>
-static int put(PyObject* d, const char* key, const std::vector<T>& v) {
-  PyObject* b = PyBytes_FromStringAndSize(reinterpret_cast<const char*>(v.data()), (Py_ssize_t)(v.size() * sizeof(T)));
+template <typename V>
+static int put(PyObject* d, const char* key, const V& v) {
+  PyObject* b = PyBytes_FromStringAndSize(reinterpret_cast<const char*>(v.data()),
+                                          (Py_ssize_t)(v.size() * sizeof(typename V::value_type)));
   if (!b) return -1;
   int rc = PyDict_SetItemString(d, key, b);
   Py_DECREF(b);
