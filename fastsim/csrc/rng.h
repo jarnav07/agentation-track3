@@ -97,6 +97,40 @@ struct MT19937 {
     return f * x2;
   }
 
+  // The std_gauss() output stream in bulk: appends outputs in stream order to `out`, at least
+  // `want` of them and at most want + 2*kBulk + 1, and leaves the generator exactly where that many
+  // sequential std_gauss() calls would (has_gauss cleared: whole pairs are always emitted). The
+  // polar method consumes 4 words per attempt whatever the outcome, so a batch of attempts can be
+  // evaluated with straight-line (vectorisable) code and only the accepted pairs kept, in order.
+  static constexpr int kBulk = 32;
+  size_t gauss_bulk(double* out, size_t want) {
+    size_t n = 0;
+    if (has_gauss) {
+      out[n++] = gauss;
+      gauss = 0;
+      has_gauss = 0;
+    }
+    uint32_t u[4 * kBulk];
+    double x1[kBulk], x2[kBulk], r2[kBulk];
+    while (n < want) {
+      for (int i = 0; i < 4 * kBulk; i++) u[i] = next32();
+      for (int i = 0; i < kBulk; i++) {
+        const int32_t a1 = (int32_t)(u[4 * i] >> 5), b1 = (int32_t)(u[4 * i + 1] >> 6);
+        const int32_t a2 = (int32_t)(u[4 * i + 2] >> 5), b2 = (int32_t)(u[4 * i + 3] >> 6);
+        x1[i] = 2.0 * ((a1 * 67108864.0 + b1) / 9007199254740992.0) - 1.0;
+        x2[i] = 2.0 * ((a2 * 67108864.0 + b2) / 9007199254740992.0) - 1.0;
+        r2[i] = x1[i] * x1[i] + x2[i] * x2[i];
+      }
+      for (int i = 0; i < kBulk; i++) {
+        if (r2[i] >= 1.0 || r2[i] == 0.0) continue;
+        const double f = std::sqrt(-2.0 * rng_log(r2[i]) / r2[i]);
+        out[n++] = f * x2[i];  // returned first
+        out[n++] = f * x1[i];  // the cached half
+      }
+    }
+    return n;
+  }
+
   // RandomState.normal(loc, scale)
   inline double normal(double loc, double scale) { return loc + scale * std_gauss(); }
   // RandomState.lognormal(mean, sigma)

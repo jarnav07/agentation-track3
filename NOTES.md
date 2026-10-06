@@ -514,3 +514,48 @@ a second binary).
 |---|---|---|
 | self-reported eps, mean over 65 units, in-container (regression run) | 6.10M | **7.40M** |
 | batch units, in-container | 0.97M–1.50M | **1.57M–2.24M** |
+
+---
+
+## Phase 8 — Fast parquet writer (image build `n6`)
+
+**Executive summary.** Writing the two output files took 5–6× as long as the simulation itself.
+A purpose-built writer now produces the same bytes about twice as fast. Development's single-unit
+timer never included the writer, so its effect there is on the 6 batch units (whose timer does,
+as the baseline's does): +36% from the writer and +12% from writing sequentially inside each batch
+worker. Final's container-window metric improves 14%.
+
+**How it stays byte-identical** (`fastsim/csrc/pqfast.cpp`): only the per-value part of
+parquet-cpp 15.0.2's column writer is re-implemented — batches of 1024, data-page cut at an
+estimated 1 MiB, dictionary in first-occurrence order with fallback to PLAIN at 1 MiB, RLE/bit-packed
+indices and definition levels, per-page min/max/null-count statistics merged into the chunk.
+libparquet's own `PageWriter` (page headers, snappy), `*MetaDataBuilder`s and
+`WriteFileMetaData` still produce every header, the schema and the footer.
+`fastsim/csrc/rle_fast.h` reproduces `arrow::util::RleEncoder`'s run decisions inline
+(`fastsim/tests/test_rle_fast.cpp`: 300,000 random sequences, 0 mismatches against arrow's).
+`FASTSIM_LIBPARQUET_WRITER=1` switches back to `WriteTable`; anything unexpected (0 rows, other
+layouts) falls back automatically. The SHA-256 now hashes the in-memory image instead of re-reading
+the file.
+
+Also: the lognormal latency stream draws its gaussians in bulk (`MT19937::gauss_bulk`; each
+polar-method attempt consumes 4 words whatever the outcome, so attempts are evaluated in batches
+and only accepted pairs kept, in order).
+
+Tried and dropped: a helper thread drawing latency blocks (neutral to negative on this host); a
+per-thread cache of buffer mappings for batch mode (no gain).
+
+### Checks on build `n6` (this session runs on a different, slower host: Xeon @ 2.8 GHz, no SHA-NI)
+
+| check | result |
+|---|---|
+| local oracle (65 × 3 seeds) | **195 / 195** |
+| image oracle, 65 × 3 seeds + 6 batch units | **201 / 201 byte-identical** |
+| edge cases through the image | **44 / 44** |
+| `run_regression.py` | **65 / 65 PASS** |
+| batch units | **6 / 6 PASS** |
+
+| metric (same host, back to back) | `n5` | `n6` |
+|---|---|---|
+| batch units, mean of 6 (`simulate-batch`, native) | 1.40M | **2.25M** |
+| Final proxy (`window_rates.py`, mean over 65) | 310k | **353k** |
+| single-unit self-reported eps, in-container | unchanged (loop untouched apart from the bulk gaussians) | 6.31M on this slower host |

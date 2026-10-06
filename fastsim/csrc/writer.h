@@ -10,7 +10,8 @@
 
 namespace fastsim {
 
-bool write_trace_parquet(const Output& o, const std::string& path, std::string& err);
-bool write_ledger_parquet(const Output& o, const std::string& path, std::string& err);
+// `sha` (optional) receives the SHA-256 hex digest of the written file.
+bool write_trace_parquet(const Output& o, const std::string& path, std::string& err, std::string* sha = nullptr);
+bool write_ledger_parquet(const Output& o, const std::string& path, std::string& err, std::string* sha = nullptr);
 
 }  // namespace fastsim

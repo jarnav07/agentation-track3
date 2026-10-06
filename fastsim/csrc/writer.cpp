@@ -1,5 +1,8 @@
 #include "writer.h"
 
+#include "pqfast.h"
+#include "sha256.h"
+
 #include <arrow/api.h>
 #include <arrow/io/file.h>
 #include <parquet/arrow/writer.h>
@@ -7,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 namespace fastsim {
@@ -138,29 +142,66 @@ bool write_table(const std::shared_ptr<arrow::Table>& table, const std::string& 
   return true;
 }
 
+bool use_fast_writer() { return std::getenv("FASTSIM_LIBPARQUET_WRITER") == nullptr; }
+
+// Writes a file image in one go and hashes it from memory (no read-back).
+bool write_image(const std::shared_ptr<arrow::Buffer>& img, const std::string& path, std::string* sha,
+                 std::string& err) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) {
+    err = "cannot open " + path;
+    return false;
+  }
+  const size_t n = (size_t)img->size();
+  const bool ok = std::fwrite(img->data(), 1, n, f) == n;
+  if (std::fclose(f) != 0 || !ok) {
+    err = "cannot write " + path;
+    return false;
+  }
+  if (sha) {
+    Sha256 h;
+    h.update(img->data(), n);
+    *sha = h.hexdigest();
+  }
+  return true;
+}
+
 }  // namespace
 
-bool write_trace_parquet(const Output& o, const std::string& path, std::string& err) {
-  StrStorage s_msg, s_side;
+bool write_trace_parquet(const Output& o, const std::string& path, std::string& err, std::string* sha) {
   auto schema = arrow::schema(
       {arrow::field("t_ns", arrow::int64()), arrow::field("agent_id", arrow::int32()),
        arrow::field("msg_type", arrow::utf8()), arrow::field("side", arrow::utf8()),
        arrow::field("price", arrow::int64()), arrow::field("size", arrow::int64()),
        arrow::field("order_id", arrow::int64())},
       arrow::key_value_metadata({"pandas"}, {kTracePandasMeta}));
+  if (use_fast_writer()) {
+    auto i64 = [](const bvec<int64_t>& v) { PqColumn c; c.kind = PqColumn::I64; c.i64 = v.data(); return c; };
+    auto i32 = [](const bvec<int32_t>& v) { PqColumn c; c.kind = PqColumn::I32; c.i32 = v.data(); return c; };
+    auto str = [](const bvec<int32_t>& v, const char* const* names, int k) {
+      PqColumn c; c.kind = PqColumn::STR; c.codes = v.data(); c.names = names; c.n_names = k; return c;
+    };
+    std::vector<PqColumn> cols = {i64(o.t_ns), i32(o.agent_id), str(o.msg_code, kTraceMsgNames, 6),
+                                  str(o.side_code, kSideNames, 2), i64(o.price), i64(o.size), i64(o.order_id)};
+    std::shared_ptr<arrow::Buffer> img;
+    std::string why;
+    if (pq_write_fast(schema, cols, (int64_t)o.t_ns.size(), &img, why)) return write_image(img, path, sha, err);
+    if (std::getenv("FASTSIM_VERBOSE")) std::fprintf(stderr, "fast writer declined: %s\n", why.c_str());
+  }
+  StrStorage s_msg, s_side;
   auto table = arrow::Table::Make(
       schema, {prim<arrow::Int64Type>(o.t_ns), prim<arrow::Int32Type>(o.agent_id),
                strings(o.msg_code, kTraceMsgNames, 6, s_msg), strings(o.side_code, kSideNames, 2, s_side),
                prim<arrow::Int64Type>(o.price), prim<arrow::Int64Type>(o.size), prim<arrow::Int64Type>(o.order_id)});
-  return write_table(table, path, err);
+  if (!write_table(table, path, err)) return false;
+  if (sha) *sha = sha256_file(path);
+  return true;
 }
 
-bool write_ledger_parquet(const Output& o, const std::string& path, std::string& err) {
+bool write_ledger_parquet(const Output& o, const std::string& path, std::string& err, std::string* sha) {
   const size_t n = o.l_t_recv.size();
   bvec<int64_t> seq(n);
   for (size_t i = 0; i < n; i++) seq[i] = (int64_t)i;
-  std::vector<uint8_t> bm1, bm2, bm3;
-  StrStorage s_kind;
   auto schema = arrow::schema(
       {arrow::field("seq", arrow::int64()), arrow::field("t_recv_ns", arrow::int64()),
        arrow::field("t_send_ns", arrow::int64()), arrow::field("latency_ns", arrow::int64()),
@@ -168,13 +209,32 @@ bool write_ledger_parquet(const Output& o, const std::string& path, std::string&
        arrow::field("message_id", arrow::int64()), arrow::field("msg_type", arrow::utf8()),
        arrow::field("order_id", arrow::int64()), arrow::field("causal_parent", arrow::int64())},
       arrow::key_value_metadata({"pandas"}, {kLedgerPandasMeta}));
+  if (use_fast_writer()) {
+    auto i64 = [](const bvec<int64_t>& v, const bvec<uint8_t>* valid) {
+      PqColumn c; c.kind = PqColumn::I64; c.i64 = v.data(); c.valid = valid ? valid->data() : nullptr; return c;
+    };
+    auto i32 = [](const bvec<int32_t>& v) { PqColumn c; c.kind = PqColumn::I32; c.i32 = v.data(); return c; };
+    PqColumn kind;
+    kind.kind = PqColumn::STR; kind.codes = o.l_kind.data(); kind.names = kKindNames; kind.n_names = 13;
+    std::vector<PqColumn> cols = {i64(seq, nullptr), i64(o.l_t_recv, nullptr), i64(o.l_t_send, &o.l_t_send_valid),
+                                  i64(o.l_latency, nullptr), i32(o.l_src), i32(o.l_dst), i64(o.l_msg_id, nullptr), kind,
+                                  i64(o.l_order_id, &o.l_order_valid), i64(o.l_causal, &o.l_causal_valid)};
+    std::shared_ptr<arrow::Buffer> img;
+    std::string why;
+    if (pq_write_fast(schema, cols, (int64_t)n, &img, why)) return write_image(img, path, sha, err);
+    if (std::getenv("FASTSIM_VERBOSE")) std::fprintf(stderr, "fast writer declined: %s\n", why.c_str());
+  }
+  std::vector<uint8_t> bm1, bm2, bm3;
+  StrStorage s_kind;
   auto table = arrow::Table::Make(
       schema, {prim<arrow::Int64Type>(seq), prim<arrow::Int64Type>(o.l_t_recv),
                nullable_i64(o.l_t_send, o.l_t_send_valid, bm1), prim<arrow::Int64Type>(o.l_latency),
                prim<arrow::Int32Type>(o.l_src), prim<arrow::Int32Type>(o.l_dst), prim<arrow::Int64Type>(o.l_msg_id),
                strings(o.l_kind, kKindNames, 13, s_kind), nullable_i64(o.l_order_id, o.l_order_valid, bm2),
                nullable_i64(o.l_causal, o.l_causal_valid, bm3)});
-  return write_table(table, path, err);
+  if (!write_table(table, path, err)) return false;
+  if (sha) *sha = sha256_file(path);
+  return true;
 }
 
 }  // namespace fastsim

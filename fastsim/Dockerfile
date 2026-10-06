@@ -30,8 +30,8 @@ RUN PA=$(python -c "import pyarrow, os; print(os.path.dirname(pyarrow.__file__))
     && CXXF="-O3 -std=c++17 -ffp-contract=off -fno-fast-math -w -I$PA/include" \
     && LIBS="-L$PA -l:libarrow.so.1500 -l:libparquet.so.1500 -Wl,-rpath,$PA -static-libstdc++ -static-libgcc -pthread" \
     && build() { out=$1; shift; mkdir -p obj; \
-         for f in native_main native_setup engine writer; do g++ $CXXF "$@" -c csrc/$f.cpp -o obj/$f.o || return 1; done; \
-         g++ "$@" obj/native_main.o obj/native_setup.o obj/engine.o obj/writer.o csrc/svml/svml_z0_log_d_la.s $LIBS -o $out; } \
+         for f in native_main native_setup engine writer pqfast; do g++ $CXXF "$@" -c csrc/$f.cpp -o obj/$f.o || return 1; done; \
+         g++ "$@" obj/native_main.o obj/native_setup.o obj/engine.o obj/writer.o obj/pqfast.o csrc/svml/svml_z0_log_d_la.s $LIBS -o $out; } \
     && build /tmp/fastsim-train -fprofile-generate -fprofile-update=atomic \
     && (for f in pgo/*.json; do /tmp/fastsim-train simulate --config $f --out /tmp/train/trace.parquet >/dev/null || exit 1; done \
         || (echo "PGO training failed; building without a profile"; rm -f obj/*.gcda)) \

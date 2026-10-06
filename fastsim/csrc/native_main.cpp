@@ -196,17 +196,19 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   mkdirs(dir);
   std::string msg_path = dir + "/message_trace.parquet";
   std::string err;
-  // The two files are independent: write + hash them concurrently.
+  // The two files are independent: write + hash them concurrently when there is a spare core (a
+  // single run); in batch mode every core already runs a sub-scenario.
   auto t2 = std::chrono::steady_clock::now();
   std::string err2;
-  bool ok_ledger = true;
-  std::thread ledger_thread([&] {
-    ok_ledger = write_ledger_parquet(out, msg_path, err2);
-    if (ok_ledger) r.msg_sha = sha256_file(msg_path);
-  });
-  bool ok_trace = write_trace_parquet(out, trace_path, err);
-  if (ok_trace) r.trace_sha = sha256_file(trace_path);
-  ledger_thread.join();
+  bool ok_ledger = true, ok_trace;
+  if (spec.helper_threads > 0) {
+    std::thread ledger_thread([&] { ok_ledger = write_ledger_parquet(out, msg_path, err2, &r.msg_sha); });
+    ok_trace = write_trace_parquet(out, trace_path, err, &r.trace_sha);
+    ledger_thread.join();
+  } else {
+    ok_ledger = write_ledger_parquet(out, msg_path, err2, &r.msg_sha);
+    ok_trace = write_trace_parquet(out, trace_path, err, &r.trace_sha);
+  }
   if (!ok_trace || !ok_ledger) { r.error = "write: " + err + err2; return false; }
   auto t3 = std::chrono::steady_clock::now();
   if (std::getenv("FASTSIM_TIMING")) {
@@ -284,6 +286,27 @@ int cmd_simulate(int argc, char** argv) {
       best_all = std::min(best_all, all);
     }
     std::fprintf(stderr, "bench: min loop %.2f ms, min loop+assemble %.2f ms\n", best * 1e3, best_all * 1e3);
+    if (std::getenv("FASTSIM_BENCH_WRITE")) {
+      Spec c = spec;
+      Output o;
+      run_engine(c, o, nullptr);
+      for (int k = 0; k < 5; k++) {
+        struct rusage u0, u1;
+        getrusage(RUSAGE_SELF, &u0);
+        auto w0 = std::chrono::steady_clock::now();
+        std::string e1;
+        write_trace_parquet(o, "/tmp/bw_trace.parquet", e1);
+        auto w1 = std::chrono::steady_clock::now();
+        write_ledger_parquet(o, "/tmp/bw_ledger.parquet", e1);
+        auto w2 = std::chrono::steady_clock::now();
+        std::string h = sha256_file("/tmp/bw_ledger.parquet") + sha256_file("/tmp/bw_trace.parquet");
+        auto w3 = std::chrono::steady_clock::now();
+        getrusage(RUSAGE_SELF, &u1);
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::fprintf(stderr, "write %d: trace %.2f ledger %.2f sha %.2f ms minflt %ld\n", k, ms(w0, w1), ms(w1, w2), ms(w2, w3),
+                     u1.ru_minflt - u0.ru_minflt);
+      }
+    }
   }
   RunResult r;
   if (!run_one(spec, meta, out, r)) fallback("fastsim.simulate", r.error);

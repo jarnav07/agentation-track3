@@ -397,9 +397,29 @@ class Engine {
   // one draw per message interleaved with event handling. Only the consumption order matters.
   static constexpr int kLatBlock = 256;
   int64_t lat_blk[kLatBlock];
+  double lat_g[kLatBlock + 2 * MT19937::kBulk + 2];  // gaussian FIFO for the lognormal model
+  size_t lat_g0 = 0, lat_ng = 0;
   int lat_pos = kLatBlock;
   __attribute__((noinline)) void lat_refill() {
-    for (int i = 0; i < kLatBlock; i++) lat_blk[i] = draw_latency();
+    if (S.lat_model == L_LOGNORMAL) {
+      // lognormal(mu, sigma) == exp(mu + sigma * std_gauss()); the gaussians come in bulk
+      if (lat_ng - lat_g0 < (size_t)kLatBlock) {
+        std::memmove(lat_g, lat_g + lat_g0, (lat_ng - lat_g0) * sizeof(double));
+        lat_ng -= lat_g0;
+        lat_g0 = 0;
+        lat_ng += S.rngs[2].gauss_bulk(lat_g + lat_ng, kLatBlock - lat_ng);
+      }
+      const double mu = S.lat_mu, sigma = S.lat_sigma, lo = S.lat_min, hi = S.lat_max;
+      for (int i = 0; i < kLatBlock; i++) {
+        const double value = rng_exp(mu + sigma * lat_g[lat_g0 + i]);
+        const double v1 = (std::isnan(value) || value >= lo) ? value : lo;
+        const double v2 = (std::isnan(v1) || v1 <= hi) ? v1 : hi;
+        lat_blk[i] = py_round(v2);
+      }
+      lat_g0 += kLatBlock;
+    } else {
+      for (int i = 0; i < kLatBlock; i++) lat_blk[i] = draw_latency();
+    }
     lat_pos = 0;
   }
   int64_t get_latency(int32_t s, int32_t r) {
