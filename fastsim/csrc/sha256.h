@@ -1,6 +1,7 @@
 // SHA-256 (FIPS 180-4), for the trace_sha256 / message_trace_sha256 fields of events.json.
 #pragma once
 #include <cpuid.h>
+#include <dlfcn.h>
 #include <immintrin.h>
 
 #include <cstdint>
@@ -212,6 +213,36 @@ class Sha256 {
     h_[0] += a; h_[1] += bb; h_[2] += c; h_[3] += d; h_[4] += e; h_[5] += f; h_[6] += g; h_[7] += h;
   }
 };
+
+// SHA-256 of a memory buffer as hex. Uses the image's OpenSSL (libcrypto.so.3, which Python's
+// hashlib already depends on) when it can be loaded -- its hand-tuned SHA-256 (AVX2 / SHA-NI) is
+// faster than the code above -- and the code above otherwise. Same function, same digest.
+inline std::string sha256_hex(const uint8_t* data, size_t n) {
+  typedef const void* (*md_fn)();
+  typedef int (*digest_fn)(const void*, size_t, unsigned char*, unsigned int*, const void*, void*);
+  static md_fn evp_sha256 = nullptr;
+  static digest_fn evp_digest = nullptr;
+  static const bool have = [] {
+    if (std::getenv("FASTSIM_NO_OPENSSL")) return false;
+    void* h = dlopen("libcrypto.so.3", RTLD_NOW | RTLD_LOCAL);
+    if (!h) return false;
+    evp_sha256 = (md_fn)dlsym(h, "EVP_sha256");
+    evp_digest = (digest_fn)dlsym(h, "EVP_Digest");
+    return evp_sha256 && evp_digest;
+  }();
+  if (have) {
+    unsigned char md[32];
+    unsigned int len = 0;
+    if (evp_digest(data, n, md, &len, evp_sha256(), nullptr) == 1 && len == 32) {
+      char out[65];
+      for (int i = 0; i < 32; i++) std::snprintf(out + 2 * i, 3, "%02x", md[i]);
+      return std::string(out, 64);
+    }
+  }
+  Sha256 s;
+  s.update(data, n);
+  return s.hexdigest();
+}
 
 inline std::string sha256_file(const std::string& path) {
   FILE* f = std::fopen(path.c_str(), "rb");

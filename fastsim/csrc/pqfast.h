@@ -21,8 +21,9 @@ struct PqColumn {
 };
 
 // Serialises a table of `n` rows with `schema` (all fields nullable, as in writer.cpp) into a file
-// image. Returns false with `err` set if anything is unexpected; the caller then uses libparquet.
+// image, encoding column chunks on up to `threads` threads. Returns false with `err` set if anything
+// is unexpected; the caller then uses libparquet.
 bool pq_write_fast(const std::shared_ptr<arrow::Schema>& schema, const std::vector<PqColumn>& cols, int64_t n,
-                   std::shared_ptr<arrow::Buffer>* out, std::string& err);
+                   std::shared_ptr<arrow::Buffer>* out, std::string& err, int threads = 1);
 
 }  // namespace fastsim

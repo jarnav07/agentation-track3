@@ -196,15 +196,18 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   mkdirs(dir);
   std::string msg_path = dir + "/message_trace.parquet";
   std::string err;
-  // The two files are independent: write + hash them concurrently when there is a spare core (a
-  // single run); in batch mode every core already runs a sub-scenario.
+  // A single run spreads each file's column chunks over every core; in batch mode every core
+  // already runs a sub-scenario, so each writes on its own thread.
   auto t2 = std::chrono::steady_clock::now();
   std::string err2;
+  set_writer_threads(spec.helper_threads + 1);
   bool ok_ledger = true, ok_trace;
-  if (spec.helper_threads > 0) {
-    std::thread ledger_thread([&] { ok_ledger = write_ledger_parquet(out, msg_path, err2, &r.msg_sha); });
+  std::shared_ptr<arrow::Buffer> limg;
+  if (spec.helper_threads > 0 && ledger_image(out, &limg)) {
+    // save + hash the ledger while the trace is encoded
+    std::thread saver([&] { ok_ledger = save_image(limg, msg_path, &r.msg_sha, err2); });
     ok_trace = write_trace_parquet(out, trace_path, err, &r.trace_sha);
-    ledger_thread.join();
+    saver.join();
   } else {
     ok_ledger = write_ledger_parquet(out, msg_path, err2, &r.msg_sha);
     ok_trace = write_trace_parquet(out, trace_path, err, &r.trace_sha);

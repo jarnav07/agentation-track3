@@ -559,3 +559,31 @@ per-thread cache of buffer mappings for batch mode (no gain).
 | batch units, mean of 6 (`simulate-batch`, native) | 1.40M | **2.25M** |
 | Final proxy (`window_rates.py`, mean over 65) | 310k | **353k** |
 | single-unit self-reported eps, in-container | unchanged (loop untouched apart from the bulk gaussians) | 6.31M on this slower host |
+
+---
+
+## Phase 9 — Parallel file writing (image build `n7`, Final-oriented)
+
+**Executive summary.** The output files are now encoded on every core and hashed with a faster
+SHA-256, cutting the write phase by 30–45% on mid-sized units. Final's container-window metric
+improves 12% (two back-to-back rounds against `n6`: 373k → 419k and 378k → 423k events/s).
+Development's single-unit timer covers the simulation loop only, so it is unaffected.
+
+| change | why the bytes cannot change |
+|---|---|
+| Column chunks encoded and their data pages compressed on worker threads; a single thread then hands the finished pages to libparquet's `PageWriter` in schema order | Chunks are independent until they reach the file; each worker compresses with the codec `SerializedPageWriter` would create (`parquet::GetCodec`), called the way its `Compress()` calls it. Dictionary pages still go through `PageWriter::WriteDictionaryPage` |
+| Ledger image saved + hashed on a second thread while the trace is encoded | Order of the two files never mattered |
+| SHA-256 via the image's OpenSSL (`libcrypto.so.3`, loaded at run time; our own code is the fallback) | Same function; `events.json` digests checked against `hashlib` |
+| Output buffer pre-sized from the encoded size | No regrowth copies |
+
+Batch mode keeps one thread per sub-scenario (all cores already busy).
+
+### Checks on build `n7`
+
+| check | result |
+|---|---|
+| image oracle, 65 × 3 seeds + 6 batch units | **201 / 201 byte-identical** |
+| edge cases through the image | **44 / 44** |
+| `run_regression.py` | **65 / 65 PASS** |
+| batch units | **6 / 6 PASS** |
+| Final proxy (`window_rates.py`, mean over 65), `n6` → `n7`, two rounds | 373k → **419k**, 378k → **423k** |

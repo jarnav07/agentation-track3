@@ -22,6 +22,10 @@
 //    the chunk statistics when a page is cut (ResetPageStatistics).
 //  - Pages are buffered while the dictionary is in use and written after the dictionary page
 //    (Close / FallbackToPlainEncoding); after a fallback they are written eagerly.
+// Column chunks are independent until they reach the file, so each is encoded and its data pages
+// compressed (with the codec SerializedPageWriter would use, called the way it calls it) on a
+// worker thread; the finished pages are then handed to PageWriter in schema order on one thread,
+// which produces the same byte stream as writing them as they are made.
 // scripts/check_identical.py compares every output byte for byte against the baseline, and
 // FASTSIM_LIBPARQUET_WRITER=1 switches back to WriteTable for A/B checks.
 #include "pqfast.h"
@@ -42,7 +46,13 @@
 #include <parquet/statistics.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
 #include <cstring>
+#include <mutex>
+#include <thread>
 
 namespace fastsim {
 
@@ -170,11 +180,26 @@ struct Stats {
   void reset() { *this = Stats(); }
 };
 
-class ColumnWriter {
+// A finished page, in file order: a dictionary page (uncompressed; PageWriter compresses it) or a
+// compressed V1 data page.
+struct PageRec {
+  bool dict;
+  std::shared_ptr<arrow::Buffer> buf;
+  int32_t num_values;
+  parquet::Encoding::type encoding;
+  int64_t uncompressed_size;
+  parquet::EncodedStatistics stats;
+  int64_t first_row_index;
+};
+
+// Encodes one column chunk into PageRecs. Independent of every other chunk, so chunks are encoded
+// in parallel; ColumnEncoder::replay then hands the pages to libparquet's PageWriter in order.
+class ColumnEncoder {
  public:
-  ColumnWriter(const PqColumn& col, const parquet::ColumnDescriptor* descr, parquet::ColumnChunkMetaDataBuilder* meta,
-               std::unique_ptr<parquet::PageWriter> pager, const parquet::WriterProperties& props)
-      : col_(col), descr_(descr), meta_(meta), pager_(std::move(pager)), props_(props) {
+  ColumnEncoder(const PqColumn& col, const parquet::ColumnDescriptor* descr, const parquet::WriterProperties& props)
+      : col_(col), descr_(descr), props_(props) {
+    // the codec SerializedPageWriter would create (GetCodec), used the way its Compress() uses it
+    codec_ = parquet::GetCodec(props_.compression(descr_->path()));
     is_signed_ = descr_->sort_order() == parquet::SortOrder::SIGNED;
     encoding_ = props_.dictionary_index_encoding();
     i64_dict_.reset();
@@ -188,26 +213,49 @@ class ColumnWriter {
       std::sort(order.begin(), order.end(), [&](int a, int b) { return std::strcmp(col_.names[a], col_.names[b]) < 0; });
       for (int r = 0; r < col_.n_names; r++) str_rank_[order[r]] = r;
     }
-    compressed_ = *arrow::AllocateResizableBuffer(0);
   }
 
-  // Writes rows [begin, end) of the column, then closes the chunk. Returns total bytes written
-  // (ColumnWriterImpl::Close's return value).
-  int64_t write(int64_t begin, int64_t end) {
+  // Encodes rows [begin, end) of the column and closes the chunk.
+  void encode(int64_t begin, int64_t end) {
     const int64_t total = end - begin;
     const int64_t full = total / kBatch;
     for (int64_t b = 0; b < full; b++) write_batch(begin + b * kBatch, kBatch);
     if (total % kBatch) write_batch(begin + full * kBatch, total % kBatch);
     close();
-    return total_bytes_written_;
+  }
+
+  int64_t encoded_bytes() const {  // upper bound of the chunk's size in the file, less headers
+    int64_t b = 0;
+    for (const PageRec& r : recs_) b += r.dict ? codec_->MaxCompressedLen(r.buf->size(), r.buf->data()) : r.buf->size();
+    return b + 64 * (int64_t)recs_.size();
+  }
+
+  // Writes the encoded chunk through libparquet's PageWriter, as ColumnWriterImpl would have, and
+  // returns the total bytes written (ColumnWriterImpl::Close's return value).
+  int64_t replay(parquet::PageWriter* pager, parquet::ColumnChunkMetaDataBuilder* meta) {
+    int64_t total = 0;
+    for (const PageRec& r : recs_) {
+      if (r.dict) {
+        parquet::DictionaryPage page(r.buf, r.num_values, r.encoding);
+        total += pager->WriteDictionaryPage(page);
+      } else {
+        parquet::DataPageV1 page(r.buf, r.num_values, r.encoding, parquet::Encoding::RLE, parquet::Encoding::RLE,
+                                 r.uncompressed_size, r.stats, r.first_row_index);
+        total += pager->WriteDataPage(page);
+      }
+    }
+    if (rows_written_ > 0 && chunk_encoded_.is_set()) meta->SetStatistics(chunk_encoded_);
+    pager->Close(/*has_dictionary=*/true, fallback_);
+    return total;
   }
 
  private:
   const PqColumn& col_;
   const parquet::ColumnDescriptor* descr_;
-  parquet::ColumnChunkMetaDataBuilder* meta_;
-  std::unique_ptr<parquet::PageWriter> pager_;
   const parquet::WriterProperties& props_;
+  std::unique_ptr<arrow::util::Codec> codec_;
+  std::vector<PageRec> recs_, pending_;  // written order; data pages held back while the dictionary is open
+  parquet::EncodedStatistics chunk_encoded_;
   bool is_signed_ = true;
   bool fallback_ = false;
   parquet::Encoding::type encoding_;
@@ -222,11 +270,17 @@ class ColumnWriter {
   int64_t page_nulls_ = 0;
   std::vector<uint8_t> page_;          // uncompressed page image
 
-  int64_t num_buffered_values_ = 0, num_buffered_rows_ = 0, rows_written_ = 0, total_bytes_written_ = 0;
+  int64_t num_buffered_values_ = 0, num_buffered_rows_ = 0, rows_written_ = 0;
   Stats<int64_t> page_stats_, chunk_stats_;  // ints as int64; strings as rank
 
-  std::shared_ptr<arrow::ResizableBuffer> compressed_;
-  std::vector<std::unique_ptr<parquet::DataPageV1>> pages_;
+  // SerializedPageWriter::Compress
+  std::shared_ptr<arrow::Buffer> compress(const uint8_t* data, int64_t size) {
+    const int64_t max_len = codec_->MaxCompressedLen(size, data);
+    std::shared_ptr<arrow::ResizableBuffer> b = *arrow::AllocateResizableBuffer(max_len);
+    const int64_t len = *codec_->Compress(size, data, max_len, b->mutable_data());
+    PARQUET_THROW_NOT_OK(b->Resize(len, false));
+    return b;
+  }
 
   int dict_entries() const {
     switch (col_.kind) {
@@ -459,7 +513,6 @@ class ColumnWriter {
       plain_.clear();
     }
     const int64_t uncompressed_size = (int64_t)page_.size();
-    const arrow::Buffer uncompressed(page_.data(), (int64_t)page_.size());
     page_nulls_ = 0;
 
     parquet::EncodedStatistics page_stats = encode(page_stats_);
@@ -479,18 +532,10 @@ class ColumnWriter {
     page_stats_.reset();
 
     const int64_t first_row_index = rows_written_ - num_buffered_rows_;
-    if (!fallback_) {  // keep until the dictionary page is written
-      std::shared_ptr<arrow::ResizableBuffer> c = *arrow::AllocateResizableBuffer(0);
-      pager_->Compress(uncompressed, c.get());
-      pages_.push_back(std::make_unique<parquet::DataPageV1>(c, nbv, encoding_, parquet::Encoding::RLE,
-                                                             parquet::Encoding::RLE, uncompressed_size, page_stats,
-                                                             first_row_index));
-    } else {
-      pager_->Compress(uncompressed, compressed_.get());
-      parquet::DataPageV1 page(compressed_, nbv, encoding_, parquet::Encoding::RLE, parquet::Encoding::RLE,
-                               uncompressed_size, page_stats, first_row_index);
-      total_bytes_written_ += pager_->WriteDataPage(page);
-    }
+    PageRec rec{false, compress(page_.data(), uncompressed_size), nbv, encoding_, uncompressed_size, page_stats,
+                first_row_index};
+    // dictionary mode: keep until the dictionary page is written; after a fallback: in order
+    (fallback_ ? recs_ : pending_).push_back(std::move(rec));
     def_levels_.clear();
     num_buffered_values_ = 0;
     num_buffered_rows_ = 0;
@@ -518,14 +563,13 @@ class ColumnWriter {
         }
         entries = (int)str_dict_.size();
     }
-    parquet::DictionaryPage page(b, entries, props_.dictionary_page_encoding());
-    total_bytes_written_ += pager_->WriteDictionaryPage(page);
+    recs_.push_back(PageRec{true, b, entries, props_.dictionary_page_encoding(), 0, {}, 0});
   }
 
   void flush_buffered_pages() {  // FlushBufferedDataPages
     if (num_buffered_values_ > 0) add_data_page();
-    for (const auto& p : pages_) total_bytes_written_ += pager_->WriteDataPage(*p);
-    pages_.clear();
+    for (PageRec& r : pending_) recs_.push_back(std::move(r));
+    pending_.clear();
   }
 
   void fall_back() {  // FallbackToPlainEncoding
@@ -538,16 +582,14 @@ class ColumnWriter {
   void close() {  // ColumnWriterImpl::Close
     if (!fallback_) write_dictionary_page();
     flush_buffered_pages();
-    parquet::EncodedStatistics cs = encode(chunk_stats_);
-    if (rows_written_ > 0 && cs.is_set()) meta_->SetStatistics(cs);
-    pager_->Close(/*has_dictionary=*/true, fallback_);
+    chunk_encoded_ = encode(chunk_stats_);
   }
 };
 
 }  // namespace
 
 bool pq_write_fast(const std::shared_ptr<arrow::Schema>& schema, const std::vector<PqColumn>& cols, int64_t n,
-                   std::shared_ptr<arrow::Buffer>* out, std::string& err) {
+                   std::shared_ptr<arrow::Buffer>* out, std::string& err, int threads) {
   if (n <= 0 || (int)cols.size() != schema->num_fields()) {
     err = "fast writer: unsupported shape";
     return false;
@@ -578,25 +620,63 @@ bool pq_write_fast(const std::shared_ptr<arrow::Schema>& schema, const std::vect
     }
     kv->Append("ARROW:schema", arrow::util::base64_encode((*ser)->ToString()));
 
-    auto sink = *arrow::io::BufferOutputStream::Create(1 << 20);
+    // encode every (row group, column) chunk, on up to `threads` threads
+    const int ncol = descr->num_columns();
+    const int64_t nrg = (n + kRowGroup - 1) / kRowGroup;
+    std::vector<std::unique_ptr<ColumnEncoder>> enc((size_t)(nrg * ncol));
+    for (int64_t g = 0; g < nrg; g++)
+      for (int i = 0; i < ncol; i++) enc[(size_t)(g * ncol + i)].reset(new ColumnEncoder(cols[i], descr->Column(i), *props));
+    std::atomic<size_t> next{0};
+    std::string worker_err;
+    std::mutex err_mu;
+    auto work = [&]() {
+      for (size_t k; (k = next.fetch_add(1)) < enc.size();) {
+        const int64_t g = (int64_t)k / ncol;
+        try {
+          enc[k]->encode(g * kRowGroup, std::min(n, (g + 1) * kRowGroup));
+        } catch (const std::exception& e) {
+          std::lock_guard<std::mutex> l(err_mu);
+          worker_err = e.what();
+        }
+      }
+    };
+    const int nthreads = (int)std::min<size_t>((size_t)std::max(1, threads), enc.size());
+    const auto tp0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> pool;
+    for (int t = 1; t < nthreads; t++) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+    if (!worker_err.empty()) {
+      err = "fast writer: " + worker_err;
+      return false;
+    }
+
+    const auto tp1 = std::chrono::steady_clock::now();
+    // serialise in file order through libparquet (FileSerializer / RowGroupSerializer sequence)
+    int64_t image_size = 1 << 16;  // footer and page headers
+    for (const auto& e : enc) image_size += e->encoded_bytes();
+    auto sink = *arrow::io::BufferOutputStream::Create(image_size);  // no regrowth copies
     PARQUET_THROW_NOT_OK(sink->Write("PAR1", 4));  // FileSerializer::StartFile
     auto file_meta = parquet::FileMetaDataBuilder::Make(descr.get(), props);
-    int16_t rg_ordinal = 0;
-    for (int64_t off = 0; off < n; off += kRowGroup, rg_ordinal++) {
-      const int64_t end = std::min(n, off + kRowGroup);
+    for (int64_t g = 0; g < nrg; g++) {
+      const int16_t rg_ordinal = (int16_t)g;
       parquet::RowGroupMetaDataBuilder* rg = file_meta->AppendRowGroup();
       int64_t total_bytes = 0;
-      for (int i = 0; i < descr->num_columns(); i++) {
+      for (int i = 0; i < ncol; i++) {
         parquet::ColumnChunkMetaDataBuilder* cm = rg->NextColumnChunk();
         auto pager = parquet::PageWriter::Open(sink, props->compression(cm->descr()->path()), cm, rg_ordinal, (int16_t)i,
                                                props->memory_pool(), false, nullptr, nullptr,
                                                props->page_checksum_enabled(), nullptr, nullptr, parquet::CodecOptions());
-        ColumnWriter w(cols[i], cm->descr(), cm, std::move(pager), *props);
-        total_bytes += w.write(off, end);
+        total_bytes += enc[(size_t)(g * ncol + i)]->replay(pager.get(), cm);
       }
-      rg->set_num_rows(end - off);
+      rg->set_num_rows(std::min(n, (g + 1) * kRowGroup) - g * kRowGroup);
       rg->Finish(total_bytes, rg_ordinal);
     }
+    const auto tp2 = std::chrono::steady_clock::now();
+    if (std::getenv("FASTSIM_TIMING"))
+      std::fprintf(stderr, "pq: encode %.1f ms (%d threads), replay %.1f ms\n",
+                   std::chrono::duration<double, std::milli>(tp1 - tp0).count(), nthreads,
+                   std::chrono::duration<double, std::milli>(tp2 - tp1).count());
     auto meta = file_meta->Finish(kv);
     parquet::WriteFileMetaData(*meta, sink.get());
     auto buf = sink->Finish();
