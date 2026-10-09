@@ -18,6 +18,8 @@ bool ledger_image(const Output& o, PqImage* img, int threads);
 // Starts encoding the ledger from the rows the engine publishes in `feed` (Output::ledger_feed),
 // on `threads` threads; PqStream::finish then yields the image once the run has ended.
 PqStream* ledger_stream(const RowFeed& feed, int threads);
+// The same for the trace, from Output::trecs (feed: every column but msg_type; code_feed: msg_type).
+PqStream* trace_stream(const RowFeed& feed, const RowFeed& code_feed, int threads);
 
 // Encode with one thread and write. `sha` (optional) receives the SHA-256 hex digest of the written file.
 bool write_trace_parquet(const Output& o, const std::string& path, std::string& err, std::string* sha = nullptr);

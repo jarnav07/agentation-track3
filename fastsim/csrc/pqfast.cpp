@@ -967,7 +967,7 @@ bool pq_write_fast(PqSchema schema, const std::vector<PqColumn>& cols, int64_t n
 struct PqStream::Impl {
   PqSchema schema;
   std::vector<PqColumn> rel;  // offsets from the records' base
-  const RowFeed& feed;
+  std::vector<const RowFeed*> feeds;  // per column
   int ncol;
   struct ColState {
     std::atomic<int> busy{0};
@@ -983,7 +983,8 @@ struct PqStream::Impl {
   std::mutex err_mu;
   std::string err;
 
-  Impl(PqSchema s, const std::vector<PqColumn>& r, const RowFeed& f) : schema(s), rel(r), feed(f), ncol((int)r.size()) {
+  Impl(PqSchema s, const std::vector<PqColumn>& r, const std::vector<const RowFeed*>& f)
+      : schema(s), rel(r), feeds(f), ncol((int)r.size()) {
     cols.reset(new ColState[(size_t)ncol]);
   }
 
@@ -1042,17 +1043,19 @@ struct PqStream::Impl {
   void work(int id) {
     try {
       while (n_complete.load() < ncol) {
-        const bool done = feed.done.load(std::memory_order_acquire);
-        const int64_t avail = feed.avail.load(std::memory_order_acquire);
-        const uint8_t* base = feed.base.load(std::memory_order_relaxed);
-        bool worked = false;
+        bool worked = false, all_done = true;
         for (int k = 0; k < ncol; k++) {
           const int c = (k + id) % ncol;
+          const RowFeed& feed = *feeds[(size_t)c];
+          const bool done = feed.done.load(std::memory_order_acquire);
+          all_done &= done;
           if (cols[(size_t)c].complete.load(std::memory_order_relaxed) || cols[(size_t)c].busy.exchange(1, std::memory_order_acquire)) continue;
+          const int64_t avail = feed.avail.load(std::memory_order_acquire);
+          const uint8_t* base = feed.base.load(std::memory_order_relaxed);
           worked |= advance(c, base, avail, done);
           cols[(size_t)c].busy.store(0, std::memory_order_release);
         }
-        if (!worked && !done) {
+        if (!worked && !all_done) {
           timespec ts{0, 50000};
           nanosleep(&ts, nullptr);
         }
@@ -1067,7 +1070,11 @@ struct PqStream::Impl {
 };
 
 PqStream::PqStream(PqSchema schema, const std::vector<PqColumn>& rel_cols, const RowFeed& feed, int threads)
-    : impl(new Impl(schema, rel_cols, feed)) {
+    : PqStream(schema, rel_cols, std::vector<const RowFeed*>(rel_cols.size(), &feed), threads) {}
+
+PqStream::PqStream(PqSchema schema, const std::vector<PqColumn>& rel_cols, const std::vector<const RowFeed*>& feeds,
+                   int threads)
+    : impl(new Impl(schema, rel_cols, feeds)) {
   for (int t = 0; t < std::max(1, threads); t++) impl->threads.emplace_back([this, t] { impl->work(t); });
 }
 
@@ -1090,7 +1097,7 @@ bool PqStream::finish(PqImage* out, std::string& err) {
     err = "fast writer: unsupported shape";
     return false;
   }
-  const int64_t n = impl->feed.avail.load(std::memory_order_acquire);
+  const int64_t n = impl->feeds[0]->avail.load(std::memory_order_acquire);
   const int64_t nrg = (n + kRowGroup - 1) / kRowGroup;
   if (n <= 0) {
     err = "fast writer: unsupported shape";

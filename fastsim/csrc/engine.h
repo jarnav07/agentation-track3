@@ -78,6 +78,14 @@ struct LRow {
   int8_t kind, has_send, has_oid, has_causal;
 };
 
+// One trace row in final order (the streamed trace; see Output::trace_feed). code: msg code
+// (0 SUBMITTED, 1 ACCEPTED, 2 FILLED, 3 PARTIAL, 4 CANCELLED, 5 QUOTE); side: 0 BID, 1 ASK.
+struct TRec {
+  int64_t t, price, size, oid;
+  int32_t agent;
+  int8_t side, code;
+};
+
 struct Output {
   // trace (final order)
   bvec<int64_t> t_ns, price, size, order_id;
@@ -95,6 +103,15 @@ struct Output {
   // If set (with ledger_rows), the ledger rows are also published here as the loop runs, so they
   // can be encoded while it runs; `done` is set when lrows holds them all.
   RowFeed* ledger_feed = nullptr;
+  // If set, the trace is assembled while the loop runs (complete time groups, on a helper thread)
+  // into `trecs` and published in trace_feed; every field but `code` is final once published.
+  // `code` (FILLED vs PARTIAL depends on later executions) is final when trace_code_feed is
+  // published, at the end. If the run turns out not to allow it (rows out of time order),
+  // trace_streamed stays false, both feeds are marked done, and the trace is in the t_ns.. columns.
+  RowFeed* trace_feed = nullptr;
+  RowFeed* trace_code_feed = nullptr;
+  RecBuf<TRec> trecs;
+  bool trace_streamed = false;
   std::string error;
 };
 

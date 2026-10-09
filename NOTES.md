@@ -587,3 +587,32 @@ Batch mode keeps one thread per sub-scenario (all cores already busy).
 | `run_regression.py` | **65 / 65 PASS** |
 | batch units | **6 / 6 PASS** |
 | Final proxy (`window_rates.py`, mean over 65), `n6` → `n7`, two rounds | 373k → **419k**, 378k → **423k** |
+
+---
+
+## Phase 10 — No shared libraries, writing during the loop (image builds `n8`, `n9`)
+
+**Executive summary.** The native binary no longer loads Arrow/Parquet (61 MB of shared
+libraries) or OpenSSL: it writes the parquet files with its own byte-identical writer and links
+only libc. A tiny unit's process time drops from ~18 ms to ~5 ms. The message ledger is encoded
+by spare cores *while the simulation runs*, and on the two largest units the trace is too, so the
+biggest unit's process time falls from ~550 ms to ~290 ms. Outputs are unchanged byte for byte.
+
+Where the time went (gb-mega, local, n7): loop 175 ms, trace/ledger assembly 120 ms, writing
+250 ms; and on every unit ~10–15 ms of library loading/initialisation plus ~8 ms of OpenSSL
+initialisation before the first hash. Ranked Final scores are a mean of per-unit rates, so the
+fixed per-process cost weighs on the many small units and the post-loop work on the large ones.
+
+| change | why the bytes cannot change |
+|---|---|
+| Page headers, column-chunk metadata and footer serialized by a small thrift-compact writer (`pqfast.cpp`), field for field as `SerializedPageWriter`, `ColumnChunkMetaDataBuilder`, `RowGroupMetaDataBuilder` and `FileMetaDataBuilder` set them | `tests/test_pqfast.cpp` compares against the previous libparquet-backed writer (kept in `tests/`) on randomized tables: null-heavy / all-null columns, dictionary fallback, multi-page and multi-row-group; plus the oracle |
+| Data-independent footer fields (schema, pandas + `ARROW:schema` metadata, `created_by`, column orders) emitted as constants from `pq_footer_consts.h` (`tools/gen_footer_consts.py` slices them out of a reference file) | Constant for the two fixed schemas |
+| snappy 1.1.10 (the version bundled in the pyarrow 15.0.2 wheel) vendored in `csrc/third_party/snappy` | Its x86 CRC32 match-finder hash changes the output: the wheel's codec is reproduced with it **off**, which `config.h` pins regardless of compiler flags (`tests/test_snappy.cpp`: 3,010 cases, 0 mismatches; 2,701 mismatches with it on) |
+| SHA-256: built-in SHA-NI code; OpenSSL only without SHA-NI on very large files | Same digest |
+| Files written with `writev` from page buffers, hashed incrementally (no contiguous copy) | Same byte sequence |
+| Ledger columns read in place from the engine's row records (strided), encoded by helper threads during the loop as 1024-row batches become final (`RowFeed` / `PqStream`); grown buffers stay alive until the encoders finish | Each column's batches are the same, in the same order, as the one-shot encoder's |
+| Trace assembled during the loop from completed time groups (every row is recorded at the current time, which never decreases) and encoded the same way; `msg_type` (FILLED vs PARTIAL needs later executions) encoded at the end. Only when the pre-run size estimate is ≥ 500k rows: below that the extra threads cost more than they hide | Same ordering rules as `assemble()`; any row out of time order abandons the stream and `assemble()` runs as before (exercised with `FASTSIM_TEST_TRACE_ABANDON`) |
+| Threads capped at the contract's 4 CPUs | Results never depend on thread count |
+
+Local process times (best of 5–7): s001 17.9 → 5.0 ms; eq-uniform-tight 23.9 → 10 ms;
+gb-base 55 → 30 ms; mr-cancel-replace 132 → 76 ms; gb-mega 552 → 290 ms.

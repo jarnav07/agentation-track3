@@ -193,13 +193,20 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   // afterwards; in batch mode every core already runs a sub-scenario, so each writes on its own
   // thread, after its run.
   const int threads = spec.helper_threads + 1;
-  RowFeed feed;
-  std::unique_ptr<PqStream> stream;
+  RowFeed feed, tfeed, tcode_feed;
+  std::unique_ptr<PqStream> stream, tstream;
   if (spec.helper_threads > 0 && !std::getenv("FASTSIM_NO_STREAM")) {
-    out.ledger_feed = &feed;
     int st = spec.helper_threads;
     if (const char* e = std::getenv("FASTSIM_STREAM_THREADS")) st = std::max(1, std::atoi(e));
+    out.ledger_feed = &feed;
     stream.reset(ledger_stream(feed, st));
+    if (!std::getenv("FASTSIM_NO_TRACE_STREAM")) {
+      int tt = std::max(1, spec.helper_threads - 1);
+      if (const char* e = std::getenv("FASTSIM_TRACE_STREAM_THREADS")) tt = std::max(1, std::atoi(e));
+      out.trace_feed = &tfeed;
+      out.trace_code_feed = &tcode_feed;
+      tstream.reset(trace_stream(tfeed, tcode_feed, tt));
+    }
   }
   bool ok_ledger = false;
   std::string err, err2;
@@ -208,13 +215,14 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   bool ok = run_engine(spec, out, &sim_sec);
   auto t1 = std::chrono::steady_clock::now();
   if (!ok) {
-    stream.reset();  // joins (the engine has marked the feed done)
+    stream.reset();  // joins (the engine has marked the feeds done)
+    tstream.reset();
     r.error = "engine: " + out.error;
     return false;
   }
   // Same boundary as the baseline: the simulation loop only (abides.run), not trace extraction.
   r.wall = sim_sec;
-  r.n_events = (int64_t)out.t_ns.size();
+  r.n_events = (int64_t)(out.trace_streamed ? out.trecs.size() : out.t_ns.size());
   r.n_messages = (int64_t)out.lrows.size();
   auto t2 = std::chrono::steady_clock::now();
   std::thread ledger_thread;
@@ -227,7 +235,12 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   bool ok_trace;
   {
     PqImage img;
-    ok_trace = trace_image(out, &img, threads) && img.write_file(trace_path, &r.trace_sha, err);
+    if (out.trace_streamed) {
+      ok_trace = tstream->finish(&img, err) && img.write_file(trace_path, &r.trace_sha, err);
+    } else {
+      tstream.reset();  // abandoned (rows out of time order): the engine assembled the columns
+      ok_trace = trace_image(out, &img, threads) && img.write_file(trace_path, &r.trace_sha, err);
+    }
   }
   if (ledger_thread.joinable()) {
     ledger_thread.join();
@@ -239,7 +252,8 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   auto t3 = std::chrono::steady_clock::now();
   if (std::getenv("FASTSIM_TIMING")) {
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    std::fprintf(stderr, "fastsim-native timing: loop %.1f ms, loop+assemble %.1f ms, write+sha %.1f ms\n", sim_sec * 1e3, ms(t0, t1), ms(t2, t3));
+    std::fprintf(stderr, "fastsim-native timing: loop %.1f ms, loop+assemble %.1f ms, write+sha %.1f ms (ledger %s, trace %s)\n",
+                 sim_sec * 1e3, ms(t0, t1), ms(t2, t3), stream ? "streamed" : "after", out.trace_streamed ? "streamed" : "after");
   }
   std::string ev = events_json(r);
   FILE* f = std::fopen((dir + "/events.json").c_str(), "wb");
@@ -248,6 +262,8 @@ bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path
   std::fclose(f);
   return true;
 }
+
+constexpr int kMaxCpus = 4;
 
 int available_cpus() {
   cpu_set_t set;
@@ -268,6 +284,9 @@ int available_cpus() {
       if (q > 0 && p > 0) cpus = std::min<int>(cpus, std::max<int>(1, (int)(q / p)));
     }
   }
+  // The contract gives each container 4 CPUs; never start more threads than that, even where the
+  // quota is not visible (sched_getaffinity alone reports every core of the host).
+  cpus = std::min(cpus, kMaxCpus);
   if (const char* env = std::getenv("FASTSIM_BATCH_WORKERS")) cpus = std::max(1, std::atoi(env));
   return std::max(1, cpus);
 }

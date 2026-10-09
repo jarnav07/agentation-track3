@@ -92,6 +92,28 @@ PqStream* ledger_stream(const RowFeed& feed, int threads) {
   return new PqStream(PqSchema::LEDGER, ledger_columns((const LRow*)nullptr), feed, threads);
 }
 
+PqStream* trace_stream(const RowFeed& feed, const RowFeed& code_feed, int threads) {
+  const TRec* r = nullptr;  // offsets from the records' base
+  auto f = [](PqColumn::Kind kind, const void* field, size_t width) {
+    PqColumn c;
+    c.kind = kind;
+    c.data = field;
+    c.stride = sizeof(TRec);
+    c.code_bytes = (int)width;
+    return c;
+  };
+  PqColumn msg = f(PqColumn::STR, &r->code, 1), side = f(PqColumn::STR, &r->side, 1);
+  msg.names = kTraceMsgNames;
+  msg.n_names = 6;
+  side.names = kSideNames;
+  side.n_names = 2;
+  std::vector<PqColumn> cols = {f(PqColumn::I64, &r->t, 8), f(PqColumn::I32, &r->agent, 4), msg, side,
+                                f(PqColumn::I64, &r->price, 8), f(PqColumn::I64, &r->size, 8), f(PqColumn::I64, &r->oid, 8)};
+  std::vector<const RowFeed*> feeds(cols.size(), &feed);
+  feeds[2] = &code_feed;
+  return new PqStream(PqSchema::TRACE, cols, feeds, threads);
+}
+
 bool ledger_image(const Output& o, PqImage* img, int threads) {
   std::vector<PqColumn> cols;
   int64_t n;

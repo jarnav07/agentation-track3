@@ -107,7 +107,11 @@ bool pq_write_fast(PqSchema schema, const std::vector<PqColumn>& cols, int64_t n
 class PqStream {
  public:
   PqStream(PqSchema schema, const std::vector<PqColumn>& rel_cols, const RowFeed& feed, int threads);
-  ~PqStream();  // joins (feed.done must be set by then)
+  // one feed per column (same records; a column may be published later than the others, but all
+  // end at the same count)
+  PqStream(PqSchema schema, const std::vector<PqColumn>& rel_cols, const std::vector<const RowFeed*>& feeds,
+           int threads);
+  ~PqStream();  // joins (every feed must be done by then)
   PqStream(const PqStream&) = delete;
   PqStream& operator=(const PqStream&) = delete;
   bool finish(PqImage* out, std::string& err);

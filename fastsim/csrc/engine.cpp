@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <cstdio>
 #include <memory>
 
 namespace fastsim {
@@ -389,6 +390,135 @@ class Engine {
     pf_stop.store(true, std::memory_order_relaxed);
     pf_thread.join();
     pf_on = false;
+  }
+
+  // ---- streamed trace assembly (Output::trace_feed) ------------------------------------------
+  // Every trace row is recorded at the time being processed, `now`, which never decreases, so
+  // once the loop has published a time `now`, the rows and quotes of every earlier time are final:
+  // a helper thread turns those time groups into trace rows (exactly as assemble() orders them)
+  // while the loop runs. If a row ever arrives out of time order, the stream is abandoned and
+  // assemble() does the work as usual.
+  static constexpr size_t kTraceStreamMinRows = 500000;  // rows.capacity(): the pre-run estimate
+  bool ta_on = false;
+  std::thread ta_thread;
+  alignas(64) std::atomic<bool> ta_stop{false};
+  std::atomic<const Row*> ta_rbase{nullptr};
+  std::atomic<const QRow*> ta_qbase{nullptr};
+  std::atomic<size_t> ta_nr{0}, ta_nq{0};
+  std::atomic<int64_t> ta_now{INT64_MIN};
+  size_t ta_ri = 0, ta_qi = 0;  // assembler state: helper thread during the loop, then main thread
+  int64_t ta_last_t = INT64_MIN;
+  bool ta_ok = true;
+  size_t ta_abort_at = SIZE_MAX;  // test hook (FASTSIM_TEST_TRACE_ABANDON=n): abandon after n rows
+  std::vector<int32_t> ta_last_exec;  // oid -> trec index of its latest execution (or -1)
+  std::vector<int32_t> ta_idx;
+  void ta_publish() {
+    ta_rbase.store(rows.data(), std::memory_order_relaxed);
+    ta_qbase.store(qrows.data(), std::memory_order_relaxed);
+    ta_nr.store(rows.size(), std::memory_order_release);
+    ta_nq.store(qrows.size(), std::memory_order_release);
+    ta_now.store(now, std::memory_order_release);
+  }
+  void ta_emit(const Row& r) {
+    RecBuf<TRec>& out = O->trecs;
+    int8_t code;
+    switch (r.type) {
+      case T_SUBMITTED: code = 0; break;
+      case T_ACCEPTED: code = 1; break;
+      case T_EXEC: {
+        code = 3;  // PARTIAL until a later execution of the order is seen to be its last
+        if ((size_t)r.oid >= ta_last_exec.size()) ta_last_exec.resize(std::max((size_t)r.oid + 1, ta_last_exec.size() * 2), -1);
+        ta_last_exec[(size_t)r.oid] = (int32_t)out.size();
+        break;
+      }
+      default: code = 4;
+    }
+    out.push_back(TRec{r.t, r.price, r.qty, r.oid, r.agent, (int8_t)(r.bid ? 0 : 1), code});
+  }
+  // Assembles the time groups below `limit` from rows R[0, nr) and quotes Q[0, nq).
+  void ta_advance(const Row* R, size_t nr, const QRow* Q, size_t nq, int64_t limit) {
+    RecBuf<TRec>& out = O->trecs;
+    while (true) {
+      const bool hr = ta_ri < nr, hq = ta_qi < nq;
+      if (!hr && !hq) return;
+      int64_t t = hr ? R[ta_ri].t : INT64_MAX;
+      if (hq && Q[ta_qi].t < t) t = Q[ta_qi].t;
+      if (t >= limit) return;
+      if (t <= ta_last_t || out.size() >= ta_abort_at) {  // out of time order: leave it to assemble()
+        ta_ok = false;
+        return;
+      }
+      size_t re = ta_ri, qe = ta_qi;
+      while (re < nr && R[re].t == t) re++;
+      while (qe < nq && Q[qe].t == t) qe++;
+      if (qe > ta_qi) {  // quotes: per t, last per side, ordered by first appearance; before the order rows
+        int first_side = -1, second_side = -1;
+        int64_t lp[2] = {0, 0}, lq[2] = {0, 0};
+        for (size_t k = ta_qi; k < qe; k++) {
+          const int side = Q[k].bid ? 0 : 1;
+          if (first_side < 0) first_side = side;
+          else if (side != first_side && second_side < 0) second_side = side;
+          lp[side] = Q[k].price;
+          lq[side] = Q[k].qty;
+        }
+        out.push_back(TRec{t, lp[first_side], lq[first_side], -1, 0, (int8_t)first_side, 5});
+        if (second_side >= 0) out.push_back(TRec{t, lp[second_side], lq[second_side], -1, 0, (int8_t)second_side, 5});
+      }
+      if (re - ta_ri == 1) {
+        ta_emit(R[ta_ri]);
+      } else if (re > ta_ri) {  // stable by order id
+        ta_idx.clear();
+        for (size_t k = ta_ri; k < re; k++) ta_idx.push_back((int32_t)k);
+        std::stable_sort(ta_idx.begin(), ta_idx.end(), [R](int32_t a, int32_t b) { return R[a].oid < R[b].oid; });
+        for (int32_t k : ta_idx) ta_emit(R[k]);
+      }
+      ta_ri = re;
+      ta_qi = qe;
+      ta_last_t = t;
+    }
+  }
+  void ta_worker() {
+    while (!ta_stop.load(std::memory_order_relaxed) && ta_ok) {
+      const int64_t lim = ta_now.load(std::memory_order_acquire);
+      const size_t nr = ta_nr.load(std::memory_order_acquire), nq = ta_nq.load(std::memory_order_acquire);
+      const Row* R = ta_rbase.load(std::memory_order_relaxed);
+      const QRow* Q = ta_qbase.load(std::memory_order_relaxed);
+      const size_t before = O->trecs.size();
+      ta_advance(R, nr, Q, nq, lim);
+      if (O->trecs.size() != before) {
+        O->trace_feed->publish(O->trecs.data(), (int64_t)O->trecs.size());
+      } else {
+        timespec ts{0, 50000};
+        nanosleep(&ts, nullptr);
+      }
+    }
+  }
+  void ta_start() {
+    if (const char* e = std::getenv("FASTSIM_TEST_TRACE_ABANDON")) ta_abort_at = (size_t)std::atoll(e);
+    rows.defer_free();
+    qrows.defer_free();
+    O->trecs.defer_free();
+    O->trecs.reserve(rows.capacity() + qrows.capacity());
+    ta_publish();
+    ta_on = true;
+    ta_thread = std::thread([this] { ta_worker(); });
+  }
+  // Ends the helper (if running) and finishes the stream from the complete record; false if the
+  // stream was abandoned. Either way both feeds are marked done.
+  bool ta_finish(bool assemble_rest) {
+    ta_stop.store(true, std::memory_order_relaxed);
+    if (ta_thread.joinable()) ta_thread.join();
+    ta_on = false;
+    if (assemble_rest && ta_ok) ta_advance(rows.data(), rows.size(), qrows.data(), qrows.size(), INT64_MAX);
+    const bool ok = assemble_rest && ta_ok;
+    if (ok)
+      for (int32_t i : ta_last_exec)
+        if (i >= 0) O->trecs[(size_t)i].code = 2;  // the last execution of each order: FILLED
+    for (RowFeed* f : {O->trace_feed, O->trace_code_feed}) {
+      f->publish(O->trecs.data(), (int64_t)O->trecs.size());
+      f->done.store(true, std::memory_order_release);
+    }
+    return ok;
   }
 
   // The latency stream is consumed in a fixed order, independent of the simulation state, so it
@@ -885,6 +1015,7 @@ class Engine {
 
 bool Engine::run(Output& out, double* sim_sec) {
   const bool ok = run_loop(out, sim_sec);
+  if (ta_on) ta_finish(false);  // failed run: abandon the trace stream
   RowFeed* feed = out.ledger_rows ? out.ledger_feed : nullptr;
   if (feed && !feed->done.load(std::memory_order_relaxed)) {  // failed run: still hand the rows over
     out.lrows.swap(lrows);
@@ -941,6 +1072,12 @@ bool Engine::run_loop(Output& out, double* sim_sec) {
   const size_t reserved = rows.capacity() * sizeof(Row) + lrows.capacity() * sizeof(LRow) +
                           qrows.capacity() * sizeof(QRow) + tro.capacity() * sizeof(TrOrder);
   if (S.helper_threads > 0 && reserved > ((size_t)16 << 20) && !std::getenv("FASTSIM_NO_PREFAULT")) pf_start();
+  // Streaming the trace pays only on big runs (measured: a loss below ~600k trace rows, where
+  // the extra threads cost more than the assembly they hide); below that it is abandoned at once.
+  if (O->trace_feed && O->trace_code_feed) {
+    if (rows.capacity() >= kTraceStreamMinRows || std::getenv("FASTSIM_FORCE_TRACE_STREAM")) ta_start();
+    else ta_finish(false);
+  }
 
   RowFeed* const feed = O->ledger_rows ? O->ledger_feed : nullptr;
   if (feed) lrows.defer_free();
@@ -1026,6 +1163,7 @@ bool Engine::run_loop(Output& out, double* sim_sec) {
     if (!waitq[r].empty() && !prox_live[r]) push_proxy(r, (uint64_t)agent_time[r] ^ kSign);
     if (pf_on) pf_publish();
     if (feed) feed->publish(lrows.data(), (int64_t)lrows.size());
+    if (ta_on) ta_publish();
   }
   pf_finish();
   if (sim_sec) *sim_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1043,6 +1181,14 @@ void Engine::assemble() {
     }
     if (O->ledger_ready) O->ledger_ready();
   }
+  if (ta_on) {
+    O->trace_streamed = ta_finish(true);
+    if (O->trace_streamed) {
+      if (O->ledger_rows) return;
+      goto ledger;
+    }
+  }
+  {
   const size_t n = rows.size();
   // last execution per oid -> ORDER_FILLED
   std::vector<int32_t> last_exec((size_t)next_oid + 1, -1);
@@ -1131,6 +1277,8 @@ void Engine::assemble() {
     }
   }
 
+  }
+ledger:
   // ledger: transpose the delivery-ordered rows into columns
   if (O->ledger_rows) return;
   const size_t nl = lrows.size();
