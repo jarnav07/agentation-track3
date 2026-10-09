@@ -616,3 +616,17 @@ fixed per-process cost weighs on the many small units and the post-loop work on 
 
 Local process times (best of 5–7): s001 17.9 → 5.0 ms; eq-uniform-tight 23.9 → 10 ms;
 gb-base 55 → 30 ms; mr-cancel-replace 132 → 76 ms; gb-mega 552 → 290 ms.
+
+### Checks on builds `n8` and `n9`
+
+| check | `n8` | `n9` |
+|---|---|---|
+| image oracle, 65 × 3 seeds + 6 batch units | **201 / 201 byte-identical** | **201 / 201** |
+| edge cases through the image | **44 / 44** | **44 / 44** |
+| `run_regression.py` | **65 / 65 PASS** | **65 / 65 PASS** |
+| batch units | **6 / 6 PASS** | **6 / 6 PASS** |
+| Final proxy (`window_rates.py`, mean over 65), two back-to-back rounds | n7 → n8: 494k → 593k, 477k → 516k | n8 → n9: 659k → 670k, 666k → 665k |
+
+Local Docker adds ~95 ms per container (a static no-op binary measures the same), so on this
+host the proxy is dominated by that fixed cost; `n9`'s trace streaming changes only the two
+largest units.
