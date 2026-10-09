@@ -1,14 +1,12 @@
-// Fast, byte-identical parquet writer for trace.parquet / message_trace.parquet.
+// Fast, byte-identical parquet writer for trace.parquet / message_trace.parquet, self-contained
+// (no Arrow / libparquet at run time: loading and initialising those libraries cost ~10-15 ms per
+// process, a visible share of a small unit's container window).
 //
-// parquet::arrow::WriteTable spends most of its time in generic per-value machinery (Arrow memo
-// tables, virtual encoders, statistics comparators, zero-filled scratch buffers). This file
-// re-implements only the per-value part of parquet-cpp 15.0.2's TypedColumnWriterImpl for the
-// cases these files contain -- nullable INT64 / INT32 / UTF8 columns, one level, V1 data pages,
-// dictionary encoding with fallback to PLAIN -- and hands everything else to libparquet itself:
-// page headers, compression, column-chunk and row-group metadata, schema and footer are produced
-// by the library's own PageWriter, *MetaDataBuilder and WriteFileMetaData, so the file structure
-// cannot drift. Each step below names the parquet-cpp function whose behaviour it reproduces
-// (cpp/src/parquet/column_writer.cc, encoding.cc, statistics.cc at apache-arrow-15.0.2):
+// It reproduces parquet-cpp 15.0.2 (cpp/src/parquet/column_writer.cc, encoding.cc, statistics.cc,
+// metadata.cc, file_writer.cc at apache-arrow-15.0.2) driven by parquet::arrow::WriteTable with
+// pyarrow.parquet.write_table's defaults, for the cases these files contain -- nullable INT64 /
+// INT32 / UTF8 columns, one level, V1 data pages, dictionary encoding with fallback to PLAIN,
+// SNAPPY, statistics on, no page index, no checksums. Each step names the function it reproduces:
 //
 //  - DoInBatches / WriteBatch: values go in batches of write_batch_size (1024). After each batch
 //    the data page is cut if the encoder's estimated size reaches data_pagesize (1 MiB)
@@ -16,41 +14,44 @@
 //    size reaches dictionary_pagesize_limit (1 MiB) (CheckDictionarySizeLimit).
 //  - DictEncoderImpl: indices in first-occurrence order; data page = bit width byte + RLE/bit-packed
 //    hybrid (RleFast: arrow::util::RleEncoder's exact run decisions, inline); estimated size =
-//    1 + RlePreserveBufferSize(n, bit_width).
+//    1 + MaxBufferSize(bit_width, n) + MinBufferSize(bit_width).
 //  - Definition levels: RLE with a 4-byte length prefix (LevelEncoder = RleEncoder, bit width 1).
 //  - Statistics: per page min / max / null_count (TypedStatisticsImpl::Update / Encode), merged into
-//    the chunk statistics when a page is cut (ResetPageStatistics).
+//    the chunk statistics when a page is cut (ResetPageStatistics); ToThrift sets the deprecated
+//    min/max too for signed (integer) columns.
 //  - Pages are buffered while the dictionary is in use and written after the dictionary page
 //    (Close / FallbackToPlainEncoding); after a fallback they are written eagerly.
-// Column chunks are independent until they reach the file, so each is encoded and its data pages
-// compressed (with the codec SerializedPageWriter would use, called the way it calls it) on a
-// worker thread; the finished pages are then handed to PageWriter in schema order on one thread,
-// which produces the same byte stream as writing them as they are made.
-// scripts/check_identical.py compares every output byte for byte against the baseline, and
-// FASTSIM_LIBPARQUET_WRITER=1 switches back to WriteTable for A/B checks.
+//  - SerializedPageWriter: data pages and the dictionary page compressed with snappy 1.1.10's
+//    RawCompress (the codec bundled in the pyarrow wheel, vendored in third_party/snappy and built
+//    with its configuration); thrift compact PageHeader before each page; the ColumnChunk
+//    metadata (ColumnChunkMetaDataBuilder::Finish) written after each chunk and again in the
+//    footer; RowGroupMetaDataBuilder::Finish; FileMetaData with the schema, key-value metadata
+//    (pandas + ARROW:schema), created_by and column orders, which do not depend on the data and
+//    come from pq_footer_consts.h (tools/gen_footer_consts.py).
+// Column chunks are independent until they reach the file, so each is encoded and compressed on a
+// worker thread; the pages are then laid out in schema order on one thread.
+// tests/test_pqfast.cpp compares this writer with the libparquet-backed one byte for byte, and
+// scripts/check_identical.py compares every output against the baseline.
 #include "pqfast.h"
 
+#include "pq_footer_consts.h"
 #include "rle_fast.h"
+#include "sha256.h"
+#include "third_party/snappy/snappy.h"
 
-#include <arrow/io/memory.h>
-#include <arrow/ipc/writer.h>
-#include <arrow/util/base64.h>
-#include <arrow/util/rle_encoding.h>
-#include <parquet/arrow/schema.h>
-#include <parquet/column_page.h>
-#include <parquet/column_writer.h>
-#include <parquet/file_writer.h>
-#include <parquet/metadata.h>
-#include <parquet/properties.h>
-#include <parquet/schema.h>
-#include <parquet/statistics.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <atomic>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -64,29 +65,107 @@ constexpr int64_t kDictPageLimit = 1024 * 1024;  // dictionary_pagesize_limit
 constexpr size_t kMaxStatSize = 4096;            // max_statistics_size
 constexpr int64_t kRowGroup = 1024 * 1024;       // write_table(row_group_size=None) chunk
 
-std::shared_ptr<parquet::WriterProperties> writer_props() {
-  parquet::WriterProperties::Builder pb;
-  pb.data_page_version(parquet::ParquetDataPageVersion::V1)
-      ->version(parquet::ParquetVersion::PARQUET_2_6)
-      ->compression(parquet::Compression::SNAPPY)
-      ->enable_dictionary()
-      ->enable_statistics()
-      ->max_row_group_length(64LL * 1024 * 1024)
-      ->disable_page_checksum()
-      ->disable_write_page_index();
-  return pb.build();
-}
+// parquet.thrift enum values
+enum : int32_t { T_INT32 = 1, T_INT64 = 2, T_BYTE_ARRAY = 6 };                    // Type
+enum : int32_t { E_PLAIN = 0, E_RLE = 3, E_RLE_DICTIONARY = 8 };                  // Encoding
+enum : int32_t { P_DATA_PAGE = 0, P_DICTIONARY_PAGE = 2 };                        // PageType
+constexpr int32_t kCodecSnappy = 1;                                               // CompressionCodec
+// PARQUET_2_6: dictionary_index_encoding() = RLE_DICTIONARY, dictionary_page_encoding() = PLAIN
+constexpr int32_t kDictIndexEncoding = E_RLE_DICTIONARY;
+constexpr int32_t kDictPageEncoding = E_PLAIN;
 
-std::shared_ptr<parquet::ArrowWriterProperties> arrow_props() {
-  parquet::ArrowWriterProperties::Builder ab;
-  ab.store_schema()->disable_deprecated_int96_timestamps()->disallow_truncated_timestamps()->enable_compliant_nested_types();
-  return ab.build();
-}
+int num_required_bits(uint64_t x) { return x == 0 ? 0 : 64 - __builtin_clzll(x); }
 
 int bit_width_for(int num_entries) {  // DictEncoderImpl::bit_width
   if (num_entries == 0) return 0;
   if (num_entries == 1) return 1;
-  return arrow::bit_util::Log2((uint64_t)num_entries);
+  return num_required_bits((uint64_t)num_entries - 1);  // bit_util::Log2
+}
+
+int64_t bytes_for_bits(int64_t bits) { return (bits + 7) >> 3; }
+
+int rle_min_buffer_size(int bw) {  // RleEncoder::MinBufferSize
+  const int max_literal_run_size = 1 + (int)bytes_for_bits(512 * bw);
+  const int max_repeated_run_size = 5 + (int)bytes_for_bits(bw);
+  return std::max(max_literal_run_size, max_repeated_run_size);
+}
+
+int rle_max_buffer_size(int bw, int num_values) {  // RleEncoder::MaxBufferSize
+  const int num_runs = (num_values + 7) / 8;
+  const int literal_max_size = num_runs + num_runs * bw;
+  const int repeated_max_size = num_runs * (1 + (int)bytes_for_bits(bw));
+  return std::max(literal_max_size, repeated_max_size);
+}
+
+// Thrift compact protocol (TCompactProtocol, thrift 0.16), only what the parquet structs need.
+class ThriftWriter {
+ public:
+  explicit ThriftWriter(ByteBuf& b) : b_(b) {}
+  void begin_struct() { stack_[depth_++] = last_; last_ = 0; }
+  void end_struct() { b_.push(0); last_ = stack_[--depth_]; }
+  void field(int16_t id, uint8_t type) {
+    const int d = id - last_;
+    if (d > 0 && d <= 15) {
+      b_.push((uint8_t)(d << 4 | type));
+    } else {
+      b_.push(type);
+      varint(zigzag32(id));
+    }
+    last_ = id;
+  }
+  void i16(int16_t id, int16_t v) { field(id, 4); varint(zigzag32(v)); }
+  void i32(int16_t id, int32_t v) { field(id, 5); varint(zigzag32(v)); }
+  void i64(int16_t id, int64_t v) { field(id, 6); varint(zigzag64(v)); }
+  void boolean(int16_t id, bool v) { field(id, v ? 1 : 2); }
+  void binary(int16_t id, const void* p, size_t n) { field(id, 8); bytes(p, n); }
+  void binary(int16_t id, const std::string& s) { binary(id, s.data(), s.size()); }
+  void struct_field(int16_t id) { field(id, 12); begin_struct(); }
+  void list(int16_t id, uint8_t elem_type, size_t n) {
+    field(id, 9);
+    if (n < 15) {
+      b_.push((uint8_t)(n << 4 | elem_type));
+    } else {
+      b_.push((uint8_t)(0xF0 | elem_type));
+      varint(n);
+    }
+  }
+  void elem_i32(int32_t v) { varint(zigzag32(v)); }
+  void elem_string(const char* s) { bytes(s, std::strlen(s)); }
+  void raw(const void* p, size_t n) { b_.append(p, n); }
+  void varint(uint64_t v) {
+    while (v >= 0x80) {
+      b_.push((uint8_t)(v | 0x80));
+      v >>= 7;
+    }
+    b_.push((uint8_t)v);
+  }
+  static uint64_t zigzag64(int64_t v) { return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63); }
+
+ private:
+  static uint32_t zigzag32(int32_t v) { return ((uint32_t)v << 1) ^ (uint32_t)(v >> 31); }
+  void bytes(const void* p, size_t n) { varint(n); b_.append(p, n); }
+  ByteBuf& b_;
+  int16_t last_ = 0;
+  int16_t stack_[16];
+  int depth_ = 0;
+};
+
+// EncodedStatistics as ToThrift sees it.
+struct EncStats {
+  bool has_min = false, has_max = false;
+  std::string min, max;
+  int64_t null_count = 0;
+  bool is_signed = true;
+};
+
+void write_statistics(ThriftWriter& w, int16_t id, const EncStats& s) {  // ToThrift(EncodedStatistics)
+  w.struct_field(id);
+  if (s.has_max && s.is_signed) w.binary(1, s.max);
+  if (s.has_min && s.is_signed) w.binary(2, s.min);
+  w.i64(3, s.null_count);
+  if (s.has_max) w.binary(5, s.max);
+  if (s.has_min) w.binary(6, s.min);
+  w.end_struct();
 }
 
 // Open-addressing map value -> first-occurrence index (the memo table's only observable property).
@@ -180,28 +259,58 @@ struct Stats {
   void reset() { *this = Stats(); }
 };
 
-// A finished page, in file order: a dictionary page (uncompressed; PageWriter compresses it) or a
-// compressed V1 data page.
-struct PageRec {
-  bool dict;
-  std::shared_ptr<arrow::Buffer> buf;
-  int32_t num_values;
-  parquet::Encoding::type encoding;
-  int64_t uncompressed_size;
-  parquet::EncodedStatistics stats;
-  int64_t first_row_index;
+// The file being laid out: page headers, metadata and footer go into `meta`; the file is the
+// sequence of segments, each a range of `meta` (p == nullptr) or a page body held by an encoder.
+struct Layout {
+  struct Seg {
+    const uint8_t* p;
+    size_t off, n;
+  };
+  ByteBuf meta;
+  std::vector<Seg> segs;
+  int64_t pos = 0;  // file size so far
+  void meta_since(size_t from) {  // the bytes appended to meta since `from`
+    const size_t n = meta.size() - from;
+    if (!segs.empty() && segs.back().p == nullptr && segs.back().off + segs.back().n == from) segs.back().n += n;
+    else segs.push_back(Seg{nullptr, from, n});
+    pos += (int64_t)n;
+  }
+  void body(const uint8_t* p, size_t n) {
+    if (n == 0) return;
+    segs.push_back(Seg{p, 0, n});
+    pos += (int64_t)n;
+  }
 };
 
+// A finished page, in file order: the compressed dictionary page or a compressed V1 data page.
+struct PageRec {
+  bool dict;
+  ByteBuf data;  // compressed
+  int32_t num_values;
+  int32_t encoding;
+  int64_t uncompressed_size;
+  EncStats stats;  // data pages
+};
+
+// SerializedPageWriter::Compress (snappy::RawCompress, as arrow's SnappyCodec calls it)
+ByteBuf compress(const uint8_t* data, size_t size) {
+  ByteBuf b;
+  b.resize(snappy::MaxCompressedLength(size));
+  size_t len = 0;
+  snappy::RawCompress((const char*)data, size, (char*)b.data(), &len);
+  b.resize(len);
+  return b;
+}
+
 // Encodes one column chunk into PageRecs. Independent of every other chunk, so chunks are encoded
-// in parallel; ColumnEncoder::replay then hands the pages to libparquet's PageWriter in order.
+// in parallel; ColumnEncoder::write then lays the chunk out in the file.
 class ColumnEncoder {
  public:
-  ColumnEncoder(const PqColumn& col, const parquet::ColumnDescriptor* descr, const parquet::WriterProperties& props)
-      : col_(col), descr_(descr), props_(props) {
-    // the codec SerializedPageWriter would create (GetCodec), used the way its Compress() uses it
-    codec_ = parquet::GetCodec(props_.compression(descr_->path()));
-    is_signed_ = descr_->sort_order() == parquet::SortOrder::SIGNED;
-    encoding_ = props_.dictionary_index_encoding();
+  ColumnEncoder(const PqColumn& col, const char* name) : col_(col), name_(name) {
+    stride_ = col_.stride ? col_.stride
+              : col_.kind == PqColumn::I64 ? 8 : col_.kind == PqColumn::I32 ? 4 : (size_t)col_.code_bytes;
+    is_signed_ = col_.kind != PqColumn::STR;  // INT32/INT64: SIGNED; UTF8 BYTE_ARRAY: UNSIGNED
+    encoding_ = kDictIndexEncoding;
     i64_dict_.reset();
     i32_dict_.reset();
     if (col_.kind == PqColumn::STR) {
@@ -224,41 +333,134 @@ class ColumnEncoder {
     close();
   }
 
-  int64_t encoded_bytes() const {  // upper bound of the chunk's size in the file, less headers
-    int64_t b = 0;
-    for (const PageRec& r : recs_) b += r.dict ? codec_->MaxCompressedLen(r.buf->size(), r.buf->data()) : r.buf->size();
-    return b + 64 * (int64_t)recs_.size();
-  }
-
-  // Writes the encoded chunk through libparquet's PageWriter, as ColumnWriterImpl would have, and
-  // returns the total bytes written (ColumnWriterImpl::Close's return value).
-  int64_t replay(parquet::PageWriter* pager, parquet::ColumnChunkMetaDataBuilder* meta) {
-    int64_t total = 0;
+  // Lays the chunk out at the end of the file as SerializedPageWriter would (pages, then the
+  // ColumnChunk metadata), records the metadata for the footer, and returns the total bytes
+  // written (ColumnWriterImpl::Close's return value).
+  int64_t write(Layout& L) {
+    int64_t total = 0, num_values = 0, dict_offset = 0, data_offset = 0, comp = 0, uncomp = 0;
+    int dict_pages = 0, plain_pages = 0, dict_index_pages = 0;
+    bool first_data = true;
+    ByteBuf& out = L.meta;
     for (const PageRec& r : recs_) {
+      const int64_t start = L.pos;
+      const size_t h0 = out.size();
+      ThriftWriter w(out);
+      w.begin_struct();  // PageHeader
+      w.i32(1, r.dict ? P_DICTIONARY_PAGE : P_DATA_PAGE);
+      w.i32(2, (int32_t)r.uncompressed_size);
+      w.i32(3, (int32_t)r.data.size());
       if (r.dict) {
-        parquet::DictionaryPage page(r.buf, r.num_values, r.encoding);
-        total += pager->WriteDictionaryPage(page);
+        w.struct_field(7);  // DictionaryPageHeader
+        w.i32(1, r.num_values);
+        w.i32(2, r.encoding);
+        w.boolean(3, false);  // is_sorted
+        w.end_struct();
       } else {
-        parquet::DataPageV1 page(r.buf, r.num_values, r.encoding, parquet::Encoding::RLE, parquet::Encoding::RLE,
-                                 r.uncompressed_size, r.stats, r.first_row_index);
-        total += pager->WriteDataPage(page);
+        w.struct_field(5);  // DataPageHeader
+        w.i32(1, r.num_values);
+        w.i32(2, r.encoding);
+        w.i32(3, E_RLE);
+        w.i32(4, E_RLE);
+        write_statistics(w, 5, r.stats);
+        w.end_struct();
       }
+      w.end_struct();
+      const int64_t header = (int64_t)(out.size() - h0);
+      L.meta_since(h0);
+      L.body(r.data.data(), r.data.size());
+      if (r.dict) {
+        if (dict_offset == 0) dict_offset = start;
+        dict_pages++;
+      } else {
+        if (first_data) data_offset = start;
+        first_data = false;
+        num_values += r.num_values;
+        (r.encoding == E_PLAIN ? plain_pages : dict_index_pages)++;
+      }
+      uncomp += r.uncompressed_size + header;
+      comp += (int64_t)r.data.size() + header;
+      total += r.uncompressed_size + header;
     }
-    if (rows_written_ > 0 && chunk_encoded_.is_set()) meta->SetStatistics(chunk_encoded_);
-    pager->Close(/*has_dictionary=*/true, fallback_);
+    // ColumnChunkMetaDataBuilder::Finish (has_dictionary = true), then WriteTo
+    const size_t meta_start = out.size();
+    {
+      ThriftWriter w(out);
+      w.begin_struct();  // ColumnChunk
+      w.i64(2, dict_offset > 0 ? dict_offset + comp : data_offset + comp);  // file_offset
+      w.struct_field(3);                                                  // ColumnMetaData
+      w.i32(1, col_.kind == PqColumn::I64 ? T_INT64 : col_.kind == PqColumn::I32 ? T_INT32 : T_BYTE_ARRAY);
+      // encodings: dictionary page encodings, RLE (levels), data page encodings (map order)
+      int32_t encs[4];
+      int ne = 0;
+      auto add = [&](int32_t e) {
+        for (int k = 0; k < ne; k++)
+          if (encs[k] == e) return;
+        encs[ne++] = e;
+      };
+      if (dict_pages) add(kDictPageEncoding);
+      add(E_RLE);
+      if (plain_pages) add(E_PLAIN);
+      if (dict_index_pages) add(kDictIndexEncoding);
+      w.list(2, 5, (size_t)ne);
+      for (int k = 0; k < ne; k++) w.elem_i32(encs[k]);
+      w.list(3, 8, 1);
+      w.elem_string(name_);
+      w.i32(4, kCodecSnappy);
+      w.i64(5, num_values);
+      w.i64(6, uncomp);
+      w.i64(7, comp);
+      w.i64(9, data_offset);
+      if (dict_offset > 0) w.i64(11, dict_offset);
+      if (rows_written_ > 0) write_statistics(w, 12, chunk_encoded_);
+      const size_t nstats = (dict_pages ? 1 : 0) + (plain_pages ? 1 : 0) + (dict_index_pages ? 1 : 0);
+      w.list(13, 12, nstats);
+      auto stat = [&](int32_t type, int32_t enc, int32_t count) {  // PageEncodingStats
+        w.begin_struct();
+        w.i32(1, type);
+        w.i32(2, enc);
+        w.i32(3, count);
+        w.end_struct();
+      };
+      if (dict_pages) stat(P_DICTIONARY_PAGE, kDictPageEncoding, dict_pages);
+      if (plain_pages) stat(P_DATA_PAGE, E_PLAIN, plain_pages);
+      if (dict_index_pages) stat(P_DATA_PAGE, kDictIndexEncoding, dict_index_pages);
+      w.end_struct();
+      w.end_struct();
+    }
+    meta_.assign((const char*)out.data() + meta_start, out.size() - meta_start);
+    L.meta_since(meta_start);
+    first_page_offset_ = dict_offset > 0 ? dict_offset : data_offset;
+    total_compressed_ = comp;
     return total;
   }
 
+  // Streaming use: point the column at records that moved (`rel` holds offsets from base).
+  void rebase(const PqColumn& rel, const uint8_t* base) {
+    auto at = [base](const void* p) -> const void* { return p || base ? (const void*)(base + (uintptr_t)p) : nullptr; };
+    col_.data = rel.derive == PqColumn::NONE ? at(rel.data) : nullptr;
+    col_.valid = rel.valid ? (const uint8_t*)at(rel.valid) : nullptr;
+    col_.a = rel.a ? at(rel.a) : nullptr;
+    col_.b = rel.b ? at(rel.b) : nullptr;
+    col_.cond = rel.cond ? (const uint8_t*)at(rel.cond) : nullptr;
+  }
+  void feed(int64_t off, int64_t n) { write_batch(off, n); }  // rows [off, off + n), n <= kBatch
+  void finish() { close(); }
+
+  const std::string& meta() const { return meta_; }  // serialized ColumnChunk
+  int64_t first_page_offset() const { return first_page_offset_; }
+  int64_t total_compressed() const { return total_compressed_; }
+
  private:
-  const PqColumn& col_;
-  const parquet::ColumnDescriptor* descr_;
-  const parquet::WriterProperties& props_;
-  std::unique_ptr<arrow::util::Codec> codec_;
+  PqColumn col_;
+  const char* name_;
+  size_t stride_;
   std::vector<PageRec> recs_, pending_;  // written order; data pages held back while the dictionary is open
-  parquet::EncodedStatistics chunk_encoded_;
+  EncStats chunk_encoded_;
   bool is_signed_ = true;
   bool fallback_ = false;
-  parquet::Encoding::type encoding_;
+  int32_t encoding_;
+  std::string meta_;
+  int64_t first_page_offset_ = 0, total_compressed_ = 0;
 
   DictMap<int64_t> i64_dict_;
   DictMap<int32_t> i32_dict_;
@@ -273,15 +475,6 @@ class ColumnEncoder {
   int64_t num_buffered_values_ = 0, num_buffered_rows_ = 0, rows_written_ = 0;
   Stats<int64_t> page_stats_, chunk_stats_;  // ints as int64; strings as rank
 
-  // SerializedPageWriter::Compress
-  std::shared_ptr<arrow::Buffer> compress(const uint8_t* data, int64_t size) {
-    const int64_t max_len = codec_->MaxCompressedLen(size, data);
-    std::shared_ptr<arrow::ResizableBuffer> b = *arrow::AllocateResizableBuffer(max_len);
-    const int64_t len = *codec_->Compress(size, data, max_len, b->mutable_data());
-    PARQUET_THROW_NOT_OK(b->Resize(len, false));
-    return b;
-  }
-
   int dict_entries() const {
     switch (col_.kind) {
       case PqColumn::I64: return i64_dict_.size();
@@ -293,60 +486,26 @@ class ColumnEncoder {
   int64_t estimated_size() const {  // EstimatedDataEncodedSize of the current encoder
     if (!fallback_) {
       const int bw = bit_width_for(dict_entries());
-      return 1 + arrow::util::RleEncoder::MaxBufferSize(bw, (int)indices_.size()) + arrow::util::RleEncoder::MinBufferSize(bw);
+      return 1 + rle_max_buffer_size(bw, (int)indices_.size()) + rle_min_buffer_size(bw);
     }
     return (int64_t)plain_.size();
   }
-
-  void put_value(int64_t i) {
-    switch (col_.kind) {
-      case PqColumn::I64: {
-        const int64_t v = col_.i64[i];
-        if (fallback_) {
-          const size_t o = plain_.size();
-          plain_.resize(o + 8);
-          std::memcpy(plain_.data() + o, &v, 8);
-        } else {
-          auto r = i64_dict_.get_or_insert(v);
-          if (r.second) dict_encoded_size_ += 8;
-          indices_.push_back(r.first);
-        }
-        update_stats(v);
-        break;
+  void put_code(int32_t c) {  // one string value (by code)
+    if (fallback_) {
+      const uint32_t len = (uint32_t)std::strlen(col_.names[c]);
+      const size_t o = plain_.size();
+      plain_.resize(o + 4 + len);
+      std::memcpy(plain_.data() + o, &len, 4);
+      std::memcpy(plain_.data() + o + 4, col_.names[c], len);
+    } else {
+      if (str_index_[c] < 0) {
+        str_index_[c] = (int32_t)str_dict_.size();
+        str_dict_.push_back(c);
+        dict_encoded_size_ += (int)std::strlen(col_.names[c]) + 4;
       }
-      case PqColumn::I32: {
-        const int32_t v = col_.i32[i];
-        if (fallback_) {
-          const size_t o = plain_.size();
-          plain_.resize(o + 4);
-          std::memcpy(plain_.data() + o, &v, 4);
-        } else {
-          auto r = i32_dict_.get_or_insert(v);
-          if (r.second) dict_encoded_size_ += 4;
-          indices_.push_back(r.first);
-        }
-        update_stats(v);
-        break;
-      }
-      default: {
-        const int32_t c = col_.codes[i];
-        if (fallback_) {
-          const uint32_t len = (uint32_t)std::strlen(col_.names[c]);
-          const size_t o = plain_.size();
-          plain_.resize(o + 4 + len);
-          std::memcpy(plain_.data() + o, &len, 4);
-          std::memcpy(plain_.data() + o + 4, col_.names[c], len);
-        } else {
-          if (str_index_[c] < 0) {
-            str_index_[c] = (int32_t)str_dict_.size();
-            str_dict_.push_back(c);
-            dict_encoded_size_ += (int)std::strlen(col_.names[c]) + 4;
-          }
-          indices_.push_back(str_index_[c]);
-        }
-        update_stats(str_rank_[c]);
-      }
+      indices_.push_back(str_index_[c]);
     }
+    update_stats(str_rank_[c]);
   }
 
   void update_stats(int64_t v) {
@@ -359,11 +518,10 @@ class ColumnEncoder {
     }
   }
 
-  // One batch of an integer column: dictionary indices (or PLAIN bytes after a fallback) and the
-  // page statistics, in a loop specialised on type and nullability.
+  // One batch of an integer column (value k at p + k * stride): dictionary indices (or PLAIN bytes
+  // after a fallback) and the page statistics, in a loop specialised on type and nullability.
   template <typename T, bool kNullable>
-  int64_t put_ints(const T* vals, int64_t off, int64_t n, DictMap<T>& dict) {
-    const uint8_t* valid = col_.valid;
+  int64_t put_ints(const uint8_t* p, size_t stride, const uint8_t* valid, size_t vstride, int64_t n, DictMap<T>& dict) {
     int64_t nv = 0;
     bool any = page_stats_.has_minmax;
     int64_t mn = page_stats_.min, mx = page_stats_.max;
@@ -373,13 +531,14 @@ class ColumnEncoder {
       int32_t* out = indices_.data() + base;
       T last{};
       int32_t last_idx = -1;
-      for (int64_t i = off; i < off + n; i++) {
+      for (int64_t i = 0; i < n; i++) {
         if (kNullable) {
-          const uint8_t ok = valid[i] != 0;
+          const uint8_t ok = valid[(size_t)i * vstride] != 0;
           def_levels_.push_back(ok);
           if (!ok) continue;
         }
-        const T v = vals[i];
+        T v;
+        std::memcpy(&v, p + (size_t)i * stride, sizeof(T));
         int32_t idx;
         if (v == last && last_idx >= 0) {
           idx = last_idx;
@@ -396,20 +555,23 @@ class ColumnEncoder {
       }
       indices_.resize(base + (size_t)nv);
     } else {
-      for (int64_t i = off; i < off + n; i++) {
+      const size_t o = plain_.size();
+      plain_.resize(o + (size_t)n * sizeof(T));
+      uint8_t* w = plain_.data() + o;
+      for (int64_t i = 0; i < n; i++) {
         if (kNullable) {
-          const uint8_t ok = valid[i] != 0;
+          const uint8_t ok = valid[(size_t)i * vstride] != 0;
           def_levels_.push_back(ok);
           if (!ok) continue;
         }
-        const T v = vals[i];
-        const size_t o = plain_.size();
-        plain_.resize(o + sizeof(T));
-        std::memcpy(plain_.data() + o, &v, sizeof(T));
+        T v;
+        std::memcpy(&v, p + (size_t)i * stride, sizeof(T));
+        std::memcpy(w + (size_t)nv * sizeof(T), &v, sizeof(T));
         nv++;
         if (!any) { any = true; mn = mx = v; }
         else { mn = v < mn ? v : mn; mx = v > mx ? v : mx; }
       }
+      plain_.resize(o + (size_t)nv * sizeof(T));
     }
     page_stats_.has_minmax = any;
     page_stats_.min = mn;
@@ -417,30 +579,52 @@ class ColumnEncoder {
     return nv;
   }
 
-  int64_t put_strings(int64_t off, int64_t n) {  // never null in these files
-    for (int64_t i = off; i < off + n; i++) put_value(i);
-    return n;
-  }
-
   void write_batch(int64_t off, int64_t n) {
-    int64_t nv;
+    const size_t vs = col_.valid_stride;
+    const uint8_t* valid = col_.valid ? col_.valid + (size_t)off * vs : nullptr;
+    const uint8_t* data = col_.data ? (const uint8_t*)col_.data + (size_t)off * stride_ : nullptr;
+    int64_t nv = 0;
     switch (col_.kind) {
       case PqColumn::I64:
-        nv = col_.valid ? put_ints<int64_t, true>(col_.i64, off, n, i64_dict_) : put_ints<int64_t, false>(col_.i64, off, n, i64_dict_);
+        if (col_.derive != PqColumn::NONE) {
+          int64_t buf[kBatch];
+          if (col_.derive == PqColumn::SEQ) {
+            for (int64_t k = 0; k < n; k++) buf[k] = off + k;
+          } else {
+            const uint8_t* a = (const uint8_t*)col_.a + (size_t)off * stride_;
+            const uint8_t* b = (const uint8_t*)col_.b + (size_t)off * stride_;
+            const uint8_t* c = col_.cond + (size_t)off * stride_;
+            for (int64_t k = 0; k < n; k++) {
+              int64_t x, y;
+              std::memcpy(&x, a + (size_t)k * stride_, 8);
+              std::memcpy(&y, b + (size_t)k * stride_, 8);
+              buf[k] = c[(size_t)k * stride_] ? x - y : 0;
+            }
+          }
+          data = (const uint8_t*)buf;
+          nv = valid ? put_ints<int64_t, true>(data, 8, valid, vs, n, i64_dict_)
+                     : put_ints<int64_t, false>(data, 8, valid, vs, n, i64_dict_);
+        } else {
+          nv = valid ? put_ints<int64_t, true>(data, stride_, valid, vs, n, i64_dict_)
+                     : put_ints<int64_t, false>(data, stride_, valid, vs, n, i64_dict_);
+        }
         break;
       case PqColumn::I32:
-        nv = col_.valid ? put_ints<int32_t, true>(col_.i32, off, n, i32_dict_) : put_ints<int32_t, false>(col_.i32, off, n, i32_dict_);
+        nv = valid ? put_ints<int32_t, true>(data, stride_, valid, vs, n, i32_dict_)
+                   : put_ints<int32_t, false>(data, stride_, valid, vs, n, i32_dict_);
         break;
       default:
-        if (col_.valid) {  // not produced by writer.cpp; keep the generic path correct anyway
-          nv = 0;
-          for (int64_t i = off; i < off + n; i++) {
-            const uint8_t ok = col_.valid[i] != 0;
+        for (int64_t k = 0; k < n; k++) {
+          if (valid) {
+            const uint8_t ok = valid[(size_t)k * vs] != 0;
             def_levels_.push_back(ok);
-            if (ok) { put_value(i); nv++; }
+            if (!ok) continue;
           }
-        } else {
-          nv = put_strings(off, n);
+          int32_t c;
+          if (col_.code_bytes == 1) c = (int8_t)data[(size_t)k * stride_];
+          else std::memcpy(&c, data + (size_t)k * stride_, 4);
+          put_code(c);
+          nv++;
         }
     }
     page_nulls_ += n - nv;
@@ -465,23 +649,25 @@ class ColumnEncoder {
     return std::string();
   }
 
-  parquet::EncodedStatistics encode(const Stats<int64_t>& s) const {  // TypedStatisticsImpl::Encode
-    parquet::EncodedStatistics e;
+  EncStats encode(const Stats<int64_t>& s) const {  // TypedStatisticsImpl::Encode
+    EncStats e;
     if (s.has_minmax) {
-      e.set_min(encode_stat(s.min));
-      e.set_max(encode_stat(s.max));
+      e.has_min = e.has_max = true;
+      e.min = encode_stat(s.min);
+      e.max = encode_stat(s.max);
     }
-    e.set_null_count(s.null_count);
-    e.all_null_value = s.num_values == 0;
-    e.ApplyStatSizeLimits(kMaxStatSize);
-    e.set_is_signed(is_signed_);
+    e.null_count = s.null_count;
+    // ApplyStatSizeLimits(max_statistics_size)
+    if (e.max.size() > kMaxStatSize) e.has_max = false;
+    if (e.min.size() > kMaxStatSize) e.has_min = false;
+    e.is_signed = is_signed_;
     return e;
   }
 
   void add_data_page() {  // ColumnWriterImpl::AddDataPage + BuildDataPageV1
     const int nbv = (int)num_buffered_values_;
     page_.clear();
-    page_.reserve((size_t)(16 + parquet::LevelEncoder::MaxBufferSize(parquet::Encoding::RLE, 1, nbv) +
+    page_.reserve((size_t)(32 + (int64_t)def_levels_.size() / 4 + rle_max_buffer_size(1, nbv) +
                            (fallback_ ? (int64_t)plain_.size() : estimated_size())));
     page_.resize(4);
     // definition levels, RLE with a 4-byte length prefix (RleEncodeLevels)
@@ -515,7 +701,7 @@ class ColumnEncoder {
     const int64_t uncompressed_size = (int64_t)page_.size();
     page_nulls_ = 0;
 
-    parquet::EncodedStatistics page_stats = encode(page_stats_);
+    EncStats page_stats = encode(page_stats_);
     // ResetPageStatistics: merge into the chunk statistics, then reset
     chunk_stats_.num_values += page_stats_.num_values;
     chunk_stats_.null_count += page_stats_.null_count;
@@ -531,9 +717,8 @@ class ColumnEncoder {
     }
     page_stats_.reset();
 
-    const int64_t first_row_index = rows_written_ - num_buffered_rows_;
-    PageRec rec{false, compress(page_.data(), uncompressed_size), nbv, encoding_, uncompressed_size, page_stats,
-                first_row_index};
+    PageRec rec{false, compress(page_.data(), (size_t)uncompressed_size), nbv, encoding_, uncompressed_size,
+                std::move(page_stats)};
     // dictionary mode: keep until the dictionary page is written; after a fallback: in order
     (fallback_ ? recs_ : pending_).push_back(std::move(rec));
     def_levels_.clear();
@@ -541,9 +726,9 @@ class ColumnEncoder {
     num_buffered_rows_ = 0;
   }
 
-  void write_dictionary_page() {
-    std::shared_ptr<arrow::ResizableBuffer> b = *arrow::AllocateResizableBuffer(dict_encoded_size_);
-    uint8_t* p = b->mutable_data();
+  void write_dictionary_page() {  // WriteDictionaryPage, compressed here rather than in the pager
+    page_.resize((size_t)dict_encoded_size_ + 1);
+    uint8_t* p = page_.data();
     int entries;
     switch (col_.kind) {
       case PqColumn::I64:
@@ -563,7 +748,8 @@ class ColumnEncoder {
         }
         entries = (int)str_dict_.size();
     }
-    recs_.push_back(PageRec{true, b, entries, props_.dictionary_page_encoding(), 0, {}, 0});
+    recs_.push_back(PageRec{true, compress(page_.data(), (size_t)dict_encoded_size_), entries, kDictPageEncoding,
+                            dict_encoded_size_, EncStats()});
   }
 
   void flush_buffered_pages() {  // FlushBufferedDataPages
@@ -576,7 +762,7 @@ class ColumnEncoder {
     write_dictionary_page();
     flush_buffered_pages();
     fallback_ = true;
-    encoding_ = parquet::Encoding::PLAIN;
+    encoding_ = E_PLAIN;
   }
 
   void close() {  // ColumnWriterImpl::Close
@@ -586,46 +772,158 @@ class ColumnEncoder {
   }
 };
 
+const char* const kTraceNames[] = {"t_ns", "agent_id", "msg_type", "side", "price", "size", "order_id"};
+const PqColumn::Kind kTraceKinds[] = {PqColumn::I64, PqColumn::I32, PqColumn::STR, PqColumn::STR,
+                                      PqColumn::I64, PqColumn::I64, PqColumn::I64};
+const char* const kLedgerNames[] = {"seq",    "t_recv_ns",  "t_send_ns", "latency_ns", "src_id",
+                                    "dst_id", "message_id", "msg_type",  "order_id",   "causal_parent"};
+const PqColumn::Kind kLedgerKinds[] = {PqColumn::I64, PqColumn::I64, PqColumn::I64, PqColumn::I64, PqColumn::I32,
+                                       PqColumn::I32, PqColumn::I64, PqColumn::STR, PqColumn::I64, PqColumn::I64};
+
 }  // namespace
 
-bool pq_write_fast(const std::shared_ptr<arrow::Schema>& schema, const std::vector<PqColumn>& cols, int64_t n,
-                   std::shared_ptr<arrow::Buffer>* out, std::string& err, int threads) {
-  if (n <= 0 || (int)cols.size() != schema->num_fields()) {
+struct PqImage::Impl {
+  std::vector<std::unique_ptr<ColumnEncoder>> enc;  // own the page bodies
+  Layout L;
+  const uint8_t* seg_ptr(const Layout::Seg& g) const { return g.p ? g.p : L.meta.data() + g.off; }
+};
+
+PqImage::PqImage() : impl(new Impl) {}
+PqImage::~PqImage() { delete impl; }
+size_t PqImage::size() const { return (size_t)impl->L.pos; }
+
+void PqImage::copy_to(ByteBuf& out) const {
+  out.clear();
+  out.reserve(size());
+  for (const auto& g : impl->L.segs) out.append(impl->seg_ptr(g), g.n);
+}
+
+bool PqImage::write_file(const std::string& path, std::string* sha, std::string& err) const {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    err = "cannot open " + path;
+    return false;
+  }
+  Sha256 h;
+  const auto& segs = impl->L.segs;
+  bool ok = true;
+  std::vector<iovec> iov;
+  for (size_t s0 = 0; s0 < segs.size() && ok;) {
+    const size_t s1 = std::min(segs.size(), s0 + 512);
+    iov.clear();
+    for (size_t k = s0; k < s1; k++) {
+      const uint8_t* p = impl->seg_ptr(segs[k]);
+      if (sha) h.update(p, segs[k].n);
+      iov.push_back(iovec{(void*)p, segs[k].n});
+    }
+    size_t i = 0;
+    while (i < iov.size()) {  // writev may write less than asked
+      const ssize_t w = ::writev(fd, iov.data() + i, (int)std::min<size_t>(iov.size() - i, IOV_MAX));
+      if (w < 0) {
+        if (errno == EINTR) continue;
+        ok = false;
+        break;
+      }
+      size_t left = (size_t)w;
+      while (i < iov.size() && left >= iov[i].iov_len) left -= iov[i++].iov_len;
+      if (left) {
+        iov[i].iov_base = (uint8_t*)iov[i].iov_base + left;
+        iov[i].iov_len -= left;
+      }
+    }
+    s0 = s1;
+  }
+  if (::close(fd) != 0) ok = false;
+  if (!ok) {
+    err = "cannot write " + path;
+    return false;
+  }
+  if (sha) *sha = h.hexdigest();
+  return true;
+}
+
+// Lays the encoded chunks (row-group major) out in file order (FileSerializer / RowGroupSerializer
+// sequence) and appends the footer.
+static void lay_out(PqImage* out, bool trace, int64_t nrg, int ncol, int64_t n) {
+  auto& enc = out->impl->enc;
+  // lay out in file order (FileSerializer / RowGroupSerializer sequence)
+  const unsigned char* prefix = trace ? kTraceFooterPrefix : kLedgerFooterPrefix;
+  const unsigned char* suffix = trace ? kTraceFooterSuffix : kLedgerFooterSuffix;
+  const size_t prefix_len = trace ? sizeof(kTraceFooterPrefix) : sizeof(kLedgerFooterPrefix);
+  const size_t suffix_len = trace ? sizeof(kTraceFooterSuffix) : sizeof(kLedgerFooterSuffix);
+  Layout& L = out->impl->L;
+  L = Layout();
+  ByteBuf& o = L.meta;
+  o.reserve(4096 + prefix_len + suffix_len + enc.size() * 2048);
+  o.append("PAR1", 4);  // FileSerializer::StartFile
+  L.meta_since(0);
+  std::vector<int64_t> rg_bytes((size_t)nrg);
+  for (int64_t g = 0; g < nrg; g++) {
+    int64_t total_bytes = 0;
+    for (int i = 0; i < ncol; i++) total_bytes += enc[(size_t)(g * ncol + i)]->write(L);
+    rg_bytes[(size_t)g] = total_bytes;
+  }
+  // FileMetaData: constant prefix (version, schema), num_rows, row_groups, constant suffix
+  const size_t footer_start = o.size();
+  o.append(prefix, prefix_len);
+  {
+    ThriftWriter w(o);
+    o.push(0x16);  // field 3, i64
+    w.varint(ThriftWriter::zigzag64(n));
+    o.push(0x19);  // field 4, list
+    if (nrg < 15) {
+      o.push((uint8_t)(nrg << 4 | 12));
+    } else {
+      o.push(0xF0 | 12);
+      w.varint((uint64_t)nrg);
+    }
+    for (int64_t g = 0; g < nrg; g++) {  // RowGroupMetaDataBuilder::Finish
+      w.begin_struct();
+      w.list(1, 12, (size_t)ncol);
+      int64_t total_compressed = 0;
+      for (int i = 0; i < ncol; i++) {
+        const ColumnEncoder& e = *enc[(size_t)(g * ncol + i)];
+        w.raw(e.meta().data(), e.meta().size());
+        total_compressed += e.total_compressed();
+      }
+      w.i64(2, rg_bytes[(size_t)g]);
+      w.i64(3, std::min(n, (g + 1) * kRowGroup) - g * kRowGroup);
+      w.i64(5, enc[(size_t)(g * ncol)]->first_page_offset());
+      w.i64(6, total_compressed);
+      w.i16(7, (int16_t)g);
+      w.end_struct();
+    }
+  }
+  o.append(suffix, suffix_len);
+  const uint32_t footer_len = (uint32_t)(o.size() - footer_start);
+  o.append(&footer_len, 4);
+  o.append("PAR1", 4);
+  L.meta_since(footer_start);
+}
+
+bool pq_write_fast(PqSchema schema, const std::vector<PqColumn>& cols, int64_t n, PqImage* out, std::string& err,
+                   int threads) {
+  const bool trace = schema == PqSchema::TRACE;
+  const char* const* names = trace ? kTraceNames : kLedgerNames;
+  const PqColumn::Kind* kinds = trace ? kTraceKinds : kLedgerKinds;
+  const int ncol = trace ? 7 : 10;
+  if (n <= 0 || (int)cols.size() != ncol) {
     err = "fast writer: unsupported shape";
     return false;
   }
+  for (int i = 0; i < ncol; i++)
+    if (cols[i].kind != kinds[i] || (cols[i].kind == PqColumn::STR && cols[i].code_bytes != 1 && cols[i].code_bytes != 4)) {
+      err = "fast writer: unexpected column type";
+      return false;
+    }
   try {
-    auto props = writer_props();
-    auto aprops = arrow_props();
-    std::shared_ptr<parquet::SchemaDescriptor> descr;
-    auto st = parquet::arrow::ToParquetSchema(schema.get(), *props, *aprops, &descr);
-    if (!st.ok()) {
-      err = st.ToString();
-      return false;
-    }
-    for (int i = 0; i < descr->num_columns(); i++) {
-      const auto* c = descr->Column(i);
-      if (c->max_definition_level() != 1 || c->max_repetition_level() != 0 || !props->dictionary_enabled(c->path())) {
-        err = "fast writer: unexpected column layout";
-        return false;
-      }
-    }
-    // GetSchemaMetadata: the schema's own metadata, then ARROW:schema
-    std::shared_ptr<arrow::KeyValueMetadata> kv =
-        schema->metadata() ? schema->metadata()->Copy() : arrow::key_value_metadata({}, {});
-    auto ser = arrow::ipc::SerializeSchema(*schema, arrow::default_memory_pool());
-    if (!ser.ok()) {
-      err = ser.status().ToString();
-      return false;
-    }
-    kv->Append("ARROW:schema", arrow::util::base64_encode((*ser)->ToString()));
-
     // encode every (row group, column) chunk, on up to `threads` threads
-    const int ncol = descr->num_columns();
     const int64_t nrg = (n + kRowGroup - 1) / kRowGroup;
-    std::vector<std::unique_ptr<ColumnEncoder>> enc((size_t)(nrg * ncol));
+    auto& enc = out->impl->enc;
+    enc.clear();
+    enc.resize((size_t)(nrg * ncol));
     for (int64_t g = 0; g < nrg; g++)
-      for (int i = 0; i < ncol; i++) enc[(size_t)(g * ncol + i)].reset(new ColumnEncoder(cols[i], descr->Column(i), *props));
+      for (int i = 0; i < ncol; i++) enc[(size_t)(g * ncol + i)].reset(new ColumnEncoder(cols[i], names[i]));
     std::atomic<size_t> next{0};
     std::string worker_err;
     std::mutex err_mu;
@@ -652,44 +950,165 @@ bool pq_write_fast(const std::shared_ptr<arrow::Schema>& schema, const std::vect
     }
 
     const auto tp1 = std::chrono::steady_clock::now();
-    // serialise in file order through libparquet (FileSerializer / RowGroupSerializer sequence)
-    int64_t image_size = 1 << 16;  // footer and page headers
-    for (const auto& e : enc) image_size += e->encoded_bytes();
-    auto sink = *arrow::io::BufferOutputStream::Create(image_size);  // no regrowth copies
-    PARQUET_THROW_NOT_OK(sink->Write("PAR1", 4));  // FileSerializer::StartFile
-    auto file_meta = parquet::FileMetaDataBuilder::Make(descr.get(), props);
-    for (int64_t g = 0; g < nrg; g++) {
-      const int16_t rg_ordinal = (int16_t)g;
-      parquet::RowGroupMetaDataBuilder* rg = file_meta->AppendRowGroup();
-      int64_t total_bytes = 0;
-      for (int i = 0; i < ncol; i++) {
-        parquet::ColumnChunkMetaDataBuilder* cm = rg->NextColumnChunk();
-        auto pager = parquet::PageWriter::Open(sink, props->compression(cm->descr()->path()), cm, rg_ordinal, (int16_t)i,
-                                               props->memory_pool(), false, nullptr, nullptr,
-                                               props->page_checksum_enabled(), nullptr, nullptr, parquet::CodecOptions());
-        total_bytes += enc[(size_t)(g * ncol + i)]->replay(pager.get(), cm);
-      }
-      rg->set_num_rows(std::min(n, (g + 1) * kRowGroup) - g * kRowGroup);
-      rg->Finish(total_bytes, rg_ordinal);
-    }
+    lay_out(out, trace, nrg, ncol, n);
     const auto tp2 = std::chrono::steady_clock::now();
     if (std::getenv("FASTSIM_TIMING"))
-      std::fprintf(stderr, "pq: encode %.1f ms (%d threads), replay %.1f ms\n",
+      std::fprintf(stderr, "pq: encode %.1f ms (%d threads), layout %.1f ms\n",
                    std::chrono::duration<double, std::milli>(tp1 - tp0).count(), nthreads,
                    std::chrono::duration<double, std::milli>(tp2 - tp1).count());
-    auto meta = file_meta->Finish(kv);
-    parquet::WriteFileMetaData(*meta, sink.get());
-    auto buf = sink->Finish();
-    if (!buf.ok()) {
-      err = buf.status().ToString();
-      return false;
-    }
-    *out = *buf;
     return true;
   } catch (const std::exception& e) {
     err = std::string("fast writer: ") + e.what();
     return false;
   }
+}
+
+// ---- streaming: encode a growing array of records while it grows (see pqfast.h) ----------------
+struct PqStream::Impl {
+  PqSchema schema;
+  std::vector<PqColumn> rel;  // offsets from the records' base
+  const RowFeed& feed;
+  int ncol;
+  struct ColState {
+    std::atomic<int> busy{0};
+    int64_t pos = 0;  // rows fed
+    bool open = false;  // the last encoder in rgs is still being fed
+    std::atomic<bool> complete{false};
+    const uint8_t* base = nullptr;
+    std::vector<std::unique_ptr<ColumnEncoder>> rgs;  // one encoder per row group
+  };
+  std::unique_ptr<ColState[]> cols;
+  std::atomic<int> n_complete{0};
+  std::vector<std::thread> threads;
+  std::mutex err_mu;
+  std::string err;
+
+  Impl(PqSchema s, const std::vector<PqColumn>& r, const RowFeed& f) : schema(s), rel(r), feed(f), ncol((int)r.size()) {
+    cols.reset(new ColState[(size_t)ncol]);
+  }
+
+  // Feeds column c every complete batch available; returns whether it did anything.
+  bool advance(int c, const uint8_t* base, int64_t avail, bool done) {
+    ColState& st = cols[(size_t)c];
+    const char* const* names = schema == PqSchema::TRACE ? kTraceNames : kLedgerNames;
+    bool worked = false;
+    while (!st.complete) {
+      if (!st.open) {  // the next row group starts at pos (a multiple of kRowGroup)
+        if (st.pos >= avail) {
+          if (done) {
+            st.complete = true;
+            n_complete.fetch_add(1);
+          }
+          break;
+        }
+        st.rgs.emplace_back(new ColumnEncoder(rel[(size_t)c], names[c]));
+        st.open = true;
+        st.base = nullptr;
+      }
+      ColumnEncoder& e = *st.rgs.back();
+      if (base != st.base) {
+        e.rebase(rel[(size_t)c], base);
+        st.base = base;
+      }
+      const int64_t rg_end = (int64_t)st.rgs.size() * kRowGroup;
+      const int64_t lim = std::min(avail, rg_end);
+      if (st.pos + kBatch <= lim) {
+        e.feed(st.pos, kBatch);
+        st.pos += kBatch;
+        worked = true;
+        continue;
+      }
+      if (done && st.pos < lim) {  // the final, partial batch (lim == avail: rg_end is batch-aligned)
+        e.feed(st.pos, lim - st.pos);
+        st.pos = lim;
+        worked = true;
+      }
+      if (st.pos == rg_end || (done && st.pos == avail)) {
+        e.finish();  // close the row group
+        st.open = false;
+        worked = true;
+        if (done && st.pos == avail) {
+          st.complete = true;
+          n_complete.fetch_add(1);
+          break;
+        }
+        continue;
+      }
+      break;  // wait for more rows
+    }
+    return worked;
+  }
+
+  void work(int id) {
+    try {
+      while (n_complete.load() < ncol) {
+        const bool done = feed.done.load(std::memory_order_acquire);
+        const int64_t avail = feed.avail.load(std::memory_order_acquire);
+        const uint8_t* base = feed.base.load(std::memory_order_relaxed);
+        bool worked = false;
+        for (int k = 0; k < ncol; k++) {
+          const int c = (k + id) % ncol;
+          if (cols[(size_t)c].complete.load(std::memory_order_relaxed) || cols[(size_t)c].busy.exchange(1, std::memory_order_acquire)) continue;
+          worked |= advance(c, base, avail, done);
+          cols[(size_t)c].busy.store(0, std::memory_order_release);
+        }
+        if (!worked && !done) {
+          timespec ts{0, 50000};
+          nanosleep(&ts, nullptr);
+        }
+      }
+    } catch (const std::exception& e) {
+      std::lock_guard<std::mutex> l(err_mu);
+      err = e.what();
+      for (int c = 0; c < ncol; c++) cols[(size_t)c].complete = true;
+      n_complete.store(ncol);
+    }
+  }
+};
+
+PqStream::PqStream(PqSchema schema, const std::vector<PqColumn>& rel_cols, const RowFeed& feed, int threads)
+    : impl(new Impl(schema, rel_cols, feed)) {
+  for (int t = 0; t < std::max(1, threads); t++) impl->threads.emplace_back([this, t] { impl->work(t); });
+}
+
+PqStream::~PqStream() {
+  for (auto& t : impl->threads)
+    if (t.joinable()) t.join();
+  delete impl;
+}
+
+bool PqStream::finish(PqImage* out, std::string& err) {
+  for (auto& t : impl->threads)
+    if (t.joinable()) t.join();
+  if (!impl->err.empty()) {
+    err = "fast writer: " + impl->err;
+    return false;
+  }
+  const bool trace = impl->schema == PqSchema::TRACE;
+  const int ncol = impl->ncol;
+  if (ncol != (trace ? 7 : 10)) {
+    err = "fast writer: unsupported shape";
+    return false;
+  }
+  const int64_t n = impl->feed.avail.load(std::memory_order_acquire);
+  const int64_t nrg = (n + kRowGroup - 1) / kRowGroup;
+  if (n <= 0) {
+    err = "fast writer: unsupported shape";
+    return false;
+  }
+  auto& enc = out->impl->enc;
+  enc.clear();
+  for (int64_t g = 0; g < nrg; g++)
+    for (int c = 0; c < ncol; c++) {
+      auto& rgs = impl->cols[(size_t)c].rgs;
+      if ((int64_t)rgs.size() != nrg || impl->cols[(size_t)c].pos != n) {
+        err = "fast writer: stream incomplete";
+        return false;
+      }
+      enc.push_back(std::move(rgs[(size_t)g]));
+    }
+  lay_out(out, trace, nrg, ncol, n);
+  return true;
 }
 
 }  // namespace fastsim

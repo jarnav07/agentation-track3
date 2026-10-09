@@ -4,11 +4,13 @@
 // NumPy); outputs are columnar buffers in final row order.
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "big_alloc.h"
 #include "rng.h"
+#include "row_feed.h"
 
 namespace fastsim {
 
@@ -69,6 +71,13 @@ struct Spec {
   int helper_threads = 0;
 };
 
+// One message-ledger row, in delivery (seq) order.
+struct LRow {
+  int64_t mid, t_send, t_recv, oid, causal;
+  int32_t src, dst;
+  int8_t kind, has_send, has_oid, has_causal;
+};
+
 struct Output {
   // trace (final order)
   bvec<int64_t> t_ns, price, size, order_id;
@@ -77,6 +86,15 @@ struct Output {
   bvec<int64_t> l_t_recv, l_t_send, l_latency, l_msg_id, l_order_id, l_causal;
   bvec<int32_t> l_src, l_dst, l_kind;
   bvec<uint8_t> l_t_send_valid, l_order_valid, l_causal_valid;
+  // With ledger_rows set (native binary), the ledger is handed over as the engine's row records in
+  // `lrows` instead of the l_* columns, and `ledger_ready` (if set) is called as soon as they are
+  // final -- after the event loop, before the trace is assembled -- so it can be written meanwhile.
+  bool ledger_rows = false;
+  RecBuf<LRow> lrows;
+  std::function<void()> ledger_ready;
+  // If set (with ledger_rows), the ledger rows are also published here as the loop runs, so they
+  // can be encoded while it runs; `done` is set when lrows holds them all.
+  RowFeed* ledger_feed = nullptr;
   std::string error;
 };
 

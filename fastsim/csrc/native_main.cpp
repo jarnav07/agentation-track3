@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -182,35 +183,57 @@ bool prepare(const std::string& config_path, const char* seed_override, Spec& sp
 bool run_one(Spec& spec, const ScenarioMeta& meta, const std::string& trace_path, RunResult& r) {
   r.scenario_id = meta.scenario_id;
   r.seed = meta.seed;
+  std::string dir = parent_of(trace_path);
+  mkdirs(dir);
+  const std::string msg_path = dir + "/message_trace.parquet";
   Output out;
+  out.ledger_rows = true;
+  // A single run uses the spare cores to encode the ledger while the event loop runs (its rows
+  // are final as soon as they are recorded) and spreads the trace's column chunks over every core
+  // afterwards; in batch mode every core already runs a sub-scenario, so each writes on its own
+  // thread, after its run.
+  const int threads = spec.helper_threads + 1;
+  RowFeed feed;
+  std::unique_ptr<PqStream> stream;
+  if (spec.helper_threads > 0 && !std::getenv("FASTSIM_NO_STREAM")) {
+    out.ledger_feed = &feed;
+    int st = spec.helper_threads;
+    if (const char* e = std::getenv("FASTSIM_STREAM_THREADS")) st = std::max(1, std::atoi(e));
+    stream.reset(ledger_stream(feed, st));
+  }
+  bool ok_ledger = false;
+  std::string err, err2;
   auto t0 = std::chrono::steady_clock::now();
   double sim_sec = 0.0;
   bool ok = run_engine(spec, out, &sim_sec);
   auto t1 = std::chrono::steady_clock::now();
-  if (!ok) { r.error = "engine: " + out.error; return false; }
+  if (!ok) {
+    stream.reset();  // joins (the engine has marked the feed done)
+    r.error = "engine: " + out.error;
+    return false;
+  }
   // Same boundary as the baseline: the simulation loop only (abides.run), not trace extraction.
   r.wall = sim_sec;
   r.n_events = (int64_t)out.t_ns.size();
-  r.n_messages = (int64_t)out.l_t_recv.size();
-  std::string dir = parent_of(trace_path);
-  mkdirs(dir);
-  std::string msg_path = dir + "/message_trace.parquet";
-  std::string err;
-  // A single run spreads each file's column chunks over every core; in batch mode every core
-  // already runs a sub-scenario, so each writes on its own thread.
+  r.n_messages = (int64_t)out.lrows.size();
   auto t2 = std::chrono::steady_clock::now();
-  std::string err2;
-  set_writer_threads(spec.helper_threads + 1);
-  bool ok_ledger = true, ok_trace;
-  std::shared_ptr<arrow::Buffer> limg;
-  if (spec.helper_threads > 0 && ledger_image(out, &limg)) {
-    // save + hash the ledger while the trace is encoded
-    std::thread saver([&] { ok_ledger = save_image(limg, msg_path, &r.msg_sha, err2); });
-    ok_trace = write_trace_parquet(out, trace_path, err, &r.trace_sha);
-    saver.join();
+  std::thread ledger_thread;
+  if (stream) {  // finish + write the ledger while the trace is encoded
+    ledger_thread = std::thread([&] {
+      PqImage img;
+      ok_ledger = stream->finish(&img, err2) && img.write_file(msg_path, &r.msg_sha, err2);
+    });
+  }
+  bool ok_trace;
+  {
+    PqImage img;
+    ok_trace = trace_image(out, &img, threads) && img.write_file(trace_path, &r.trace_sha, err);
+  }
+  if (ledger_thread.joinable()) {
+    ledger_thread.join();
   } else {
-    ok_ledger = write_ledger_parquet(out, msg_path, err2, &r.msg_sha);
-    ok_trace = write_trace_parquet(out, trace_path, err, &r.trace_sha);
+    PqImage img;
+    ok_ledger = ledger_image(out, &img, threads) && img.write_file(msg_path, &r.msg_sha, err2);
   }
   if (!ok_trace || !ok_ledger) { r.error = "write: " + err + err2; return false; }
   auto t3 = std::chrono::steady_clock::now();

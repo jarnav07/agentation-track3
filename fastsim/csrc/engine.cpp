@@ -184,7 +184,6 @@ class Engine {
   // trace records (processing order), array-of-structs: one append per event
   struct Row { int64_t t, price, qty, oid; int32_t agent; int8_t type, bid; };
   struct QRow { int64_t t, price, qty; int8_t bid; };
-  struct LRow { int64_t mid, t_send, t_recv, oid, causal; int32_t src, dst; int8_t kind, has_send, has_oid, has_causal; };
   RecBuf<Row> rows;
   RecBuf<QRow> qrows;
   RecBuf<LRow> lrows;
@@ -881,9 +880,21 @@ class Engine {
   }
 
   void assemble();
+  bool run_loop(Output& out, double* sim_sec);
 };
 
 bool Engine::run(Output& out, double* sim_sec) {
+  const bool ok = run_loop(out, sim_sec);
+  RowFeed* feed = out.ledger_rows ? out.ledger_feed : nullptr;
+  if (feed && !feed->done.load(std::memory_order_relaxed)) {  // failed run: still hand the rows over
+    out.lrows.swap(lrows);
+    feed->publish(out.lrows.data(), (int64_t)out.lrows.size());
+    feed->done.store(true, std::memory_order_release);
+  }
+  return ok;
+}
+
+bool Engine::run_loop(Output& out, double* sim_sec) {
   O = &out;
   const auto t_start = std::chrono::steady_clock::now();
   const int32_t n = S.n_agents;
@@ -931,6 +942,8 @@ bool Engine::run(Output& out, double* sim_sec) {
                           qrows.capacity() * sizeof(QRow) + tro.capacity() * sizeof(TrOrder);
   if (S.helper_threads > 0 && reserved > ((size_t)16 << 20) && !std::getenv("FASTSIM_NO_PREFAULT")) pf_start();
 
+  RowFeed* const feed = O->ledger_rows ? O->ledger_feed : nullptr;
+  if (feed) lrows.defer_free();
   if (!set_wakeup(0, S.mkt_close)) { out.error = error; return false; }
   for (int32_t a = 0; a < n; a++)
     if (!set_wakeup(a, S.start_time)) { out.error = error; return false; }
@@ -1012,6 +1025,7 @@ bool Engine::run(Output& out, double* sim_sec) {
     if (!ok) { out.error = error; return false; }
     if (!waitq[r].empty() && !prox_live[r]) push_proxy(r, (uint64_t)agent_time[r] ^ kSign);
     if (pf_on) pf_publish();
+    if (feed) feed->publish(lrows.data(), (int64_t)lrows.size());
   }
   pf_finish();
   if (sim_sec) *sim_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1021,6 +1035,14 @@ bool Engine::run(Output& out, double* sim_sec) {
 
 // See assemble.py for the row-order rules this reproduces.
 void Engine::assemble() {
+  if (O->ledger_rows) {  // the ledger as row records, handed over first (see Output)
+    O->lrows.swap(lrows);
+    if (O->ledger_feed) {
+      O->ledger_feed->publish(O->lrows.data(), (int64_t)O->lrows.size());
+      O->ledger_feed->done.store(true, std::memory_order_release);
+    }
+    if (O->ledger_ready) O->ledger_ready();
+  }
   const size_t n = rows.size();
   // last execution per oid -> ORDER_FILLED
   std::vector<int32_t> last_exec((size_t)next_oid + 1, -1);
@@ -1110,6 +1132,7 @@ void Engine::assemble() {
   }
 
   // ledger: transpose the delivery-ordered rows into columns
+  if (O->ledger_rows) return;
   const size_t nl = lrows.size();
   O->l_msg_id.resize(nl); O->l_src.resize(nl); O->l_dst.resize(nl); O->l_kind.resize(nl);
   O->l_t_send.resize(nl); O->l_t_send_valid.resize(nl); O->l_t_recv.resize(nl); O->l_latency.resize(nl);

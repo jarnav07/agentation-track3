@@ -214,10 +214,15 @@ class Sha256 {
   }
 };
 
-// SHA-256 of a memory buffer as hex. Uses the image's OpenSSL (libcrypto.so.3, which Python's
-// hashlib already depends on) when it can be loaded -- its hand-tuned SHA-256 (AVX2 / SHA-NI) is
-// faster than the code above -- and the code above otherwise. Same function, same digest.
+// SHA-256 of a memory buffer as hex. With SHA-NI the code above is as fast as OpenSSL; without it,
+// buffers large enough to repay libcrypto's load + initialisation (~5-8 ms, measured) go through the
+// image's OpenSSL (libcrypto.so.3, which Python's hashlib already depends on). Same digest.
 inline std::string sha256_hex(const uint8_t* data, size_t n) {
+  if (cpu_has_sha_ni() || n < ((size_t)32 << 20)) {
+    Sha256 s;
+    s.update(data, n);
+    return s.hexdigest();
+  }
   typedef const void* (*md_fn)();
   typedef int (*digest_fn)(const void*, size_t, unsigned char*, unsigned int*, const void*, void*);
   static md_fn evp_sha256 = nullptr;

@@ -73,7 +73,12 @@ class RecBuf {
   RecBuf() = default;
   RecBuf(const RecBuf&) = delete;
   RecBuf& operator=(const RecBuf&) = delete;
-  ~RecBuf() { if (p_) BigAlloc<T>().deallocate(p_, cap_); }
+  ~RecBuf() {
+    if (p_) BigAlloc<T>().deallocate(p_, cap_);
+    for (auto& o : old_) BigAlloc<T>().deallocate(o.first, o.second);
+  }
+  // Keep superseded buffers until destruction (another thread may still be reading them).
+  void defer_free() { defer_ = true; }
   void reserve(size_t n) { if (n > cap_) regrow(n); }
   __attribute__((always_inline)) void push_back(const T& v) {
     if (__builtin_expect(n_ == cap_, 0)) regrow(cap_ ? 2 * cap_ : 64);
@@ -85,17 +90,29 @@ class RecBuf {
   const T* data() const { return p_; }
   T& operator[](size_t i) { return p_[i]; }
   const T& operator[](size_t i) const { return p_[i]; }
+  void swap(RecBuf& o) noexcept {
+    std::swap(p_, o.p_);
+    std::swap(n_, o.n_);
+    std::swap(cap_, o.cap_);
+    std::swap(defer_, o.defer_);
+    old_.swap(o.old_);
+  }
 
  private:
   __attribute__((noinline)) void regrow(size_t n) {
     T* q = BigAlloc<T>().allocate(n);
     if (n_) std::memcpy((void*)q, (const void*)p_, n_ * sizeof(T));
-    if (p_) BigAlloc<T>().deallocate(p_, cap_);
+    if (p_) {
+      if (defer_) old_.emplace_back(p_, cap_);
+      else BigAlloc<T>().deallocate(p_, cap_);
+    }
     p_ = q;
     cap_ = n;
   }
   T* p_ = nullptr;
   size_t n_ = 0, cap_ = 0;
+  bool defer_ = false;
+  std::vector<std::pair<T*, size_t>> old_;
 };
 
 }  // namespace fastsim

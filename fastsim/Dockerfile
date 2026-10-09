@@ -3,9 +3,10 @@
 #   docker build --platform=linux/amd64 -t track3-fastsim:latest fastsim/
 #
 # `simulate` / `simulate-batch` are a native binary (csrc/native_main.cpp): scenario parsing,
-# NumPy-identical seeding, the event engine and parquet writing, with no interpreter start-up. It
-# writes parquet through the libarrow/libparquet shipped in the pyarrow 15.0.2 wheel (the library
-# that wrote the reference traces), linked from site-packages. Anything the native path is not
+# NumPy-identical seeding, the event engine and parquet writing, with no interpreter start-up and
+# no shared libraries beyond libc / libm. Its parquet writer (csrc/pqfast.cpp) reproduces the
+# bytes of the pyarrow 15.0.2 wheel's parquet-cpp (the library that wrote the reference traces),
+# with that wheel's snappy version vendored (csrc/third_party/snappy). Anything the native path is not
 # certain about is handed to the Python implementation (`python3 -m fastsim.simulate`), which is
 # kept in the image with the baseline's run-time stack (Python 3.11, numpy 1.26.4, pyarrow 15.0.2).
 # Nothing is fetched at run time (`--network none`).
@@ -26,16 +27,17 @@ RUN python setup.py -q build_ext --inplace && ls fastsim/_engine*.so
 # (public scenarios; see pgo/README.md). No fast-math, no FMA contraction: the floating-point
 # sequence is NumPy's, so the profile changes code layout only, never output.
 COPY pgo ./pgo
-RUN PA=$(python -c "import pyarrow, os; print(os.path.dirname(pyarrow.__file__))") \
-    && CXXF="-O3 -std=c++17 -ffp-contract=off -fno-fast-math -w -I$PA/include" \
-    && LIBS="-L$PA -l:libarrow.so.1500 -l:libparquet.so.1500 -Wl,-rpath,$PA -static-libstdc++ -static-libgcc -pthread" \
+RUN CXXF="-O3 -std=c++17 -ffp-contract=off -fno-fast-math -w" \
+    && SNAPPY="snappy snappy-sinksource snappy-stubs-internal" \
     && build() { out=$1; shift; mkdir -p obj; \
          for f in native_main native_setup engine writer pqfast; do g++ $CXXF "$@" -c csrc/$f.cpp -o obj/$f.o || return 1; done; \
-         g++ "$@" obj/native_main.o obj/native_setup.o obj/engine.o obj/writer.o obj/pqfast.o csrc/svml/svml_z0_log_d_la.s $LIBS -o $out; } \
+         for f in $SNAPPY; do g++ -O2 -std=c++17 -w -DHAVE_CONFIG_H "$@" -c csrc/third_party/snappy/$f.cc -o obj/$f.o || return 1; done; \
+         g++ "$@" obj/*.o csrc/svml/svml_z0_log_d_la.s -static-libstdc++ -static-libgcc -pthread -o $out; } \
     && build /tmp/fastsim-train -fprofile-generate -fprofile-update=atomic \
     && (for f in pgo/*.json; do /tmp/fastsim-train simulate --config $f --out /tmp/train/trace.parquet >/dev/null || exit 1; done \
         || (echo "PGO training failed; building without a profile"; rm -f obj/*.gcda)) \
-    && build /src/fastsim-native -fprofile-use -fprofile-correction -Wno-missing-profile
+    && rm -f obj/*.o && build /src/fastsim-native -fprofile-use -fprofile-correction -Wno-missing-profile \
+    && ldd /src/fastsim-native
 
 # ---- run-time stage ----------------------------------------------------------------------------
 FROM --platform=linux/amd64 python:3.11-slim@sha256:6f31d6e9ba2b0a787a3f81c37b004155b87b9efa1b771182bd550c1615745be5
